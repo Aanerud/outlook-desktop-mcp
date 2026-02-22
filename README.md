@@ -4,9 +4,9 @@
 [![Python](https://img.shields.io/pypi/pyversions/outlook-desktop-mcp)](https://pypi.org/project/outlook-desktop-mcp/)
 [![Platform](https://img.shields.io/badge/platform-Windows-blue)]()
 
-**Turn your running Outlook Desktop into an MCP server.** No Microsoft Graph API, no Entra app registration, no OAuth tokens — just your local Outlook and the authentication you already have.
+**Turn your running Outlook Desktop into an MCP server with 29 tools.** No Microsoft Graph API, no Entra app registration, no OAuth tokens — just your local Outlook and the authentication you already have.
 
-Any MCP client (Claude Code, Claude Desktop, etc.) can then send emails, read your inbox, search messages, manage folders, and more — all through your existing Outlook session.
+Any MCP client (Claude Code, Claude Desktop, etc.) can then send emails, manage your calendar, create tasks, handle attachments, and more — all through your existing Outlook session.
 
 ## Quick Start
 
@@ -22,7 +22,7 @@ pip install outlook-desktop-mcp
 claude mcp add outlook-desktop -- outlook-desktop-mcp
 ```
 
-**3. Open Outlook Desktop (Classic) and start a Claude Code session.** That's it. Nine email tools are now available.
+**3. Open Outlook Desktop (Classic) and start a Claude Code session.** That's it — 29 tools are available immediately.
 
 ## How It Works
 
@@ -53,9 +53,11 @@ Internally, the server runs a dedicated COM thread (Single-Threaded Apartment) t
 - **Python 3.12+**
 - **Outlook must be running** when the MCP server starts
 
-## Available Tools
+## Available Tools (29)
 
 All tool descriptions are optimized for LLM tool discovery — Claude understands exactly how to use each one, what arguments to pass, and what to expect back.
+
+### Email (9 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -68,6 +70,56 @@ All tool descriptions are optimized for LLM tool discovery — Claude understand
 | `mark_as_unread` | Mark a specific email as unread |
 | `move_email` | Move an email to Archive, Trash, or any folder |
 | `list_folders` | Browse the complete folder hierarchy with item counts |
+
+### Calendar (8 tools)
+
+| Tool | Description |
+|------|-------------|
+| `list_events` | List upcoming events with recurring occurrence support |
+| `get_event` | Read full event details by entry ID |
+| `create_event` | Create a personal calendar appointment |
+| `create_meeting` | Create a meeting and send invitations to attendees |
+| `update_event` | Modify an existing event's subject, time, location, etc. |
+| `delete_event` | Delete an appointment or cancel a meeting (sends notices) |
+| `respond_to_meeting` | Accept, decline, or tentatively accept a meeting invite |
+| `search_events` | Search calendar events by keyword within a date range |
+
+### Tasks (5 tools)
+
+| Tool | Description |
+|------|-------------|
+| `list_tasks` | List pending or completed tasks, sorted by due date |
+| `get_task` | Read full task details including body and completion status |
+| `create_task` | Create a new task with subject, due date, importance |
+| `complete_task` | Mark a task as complete (100%) |
+| `delete_task` | Remove a task |
+
+### Attachments (2 tools)
+
+| Tool | Description |
+|------|-------------|
+| `list_attachments` | List all attachments on an email or calendar event |
+| `save_attachment` | Download an attachment to a local directory |
+
+### Categories (2 tools)
+
+| Tool | Description |
+|------|-------------|
+| `list_categories` | List all available color categories in Outlook |
+| `set_category` | Set or clear categories on any email, event, or task |
+
+### Rules (2 tools)
+
+| Tool | Description |
+|------|-------------|
+| `list_rules` | List all mail rules with enabled/disabled status |
+| `toggle_rule` | Enable or disable a mail rule by name |
+
+### Out of Office (1 tool)
+
+| Tool | Description |
+|------|-------------|
+| `get_out_of_office` | Check whether Out of Office auto-reply is on or off |
 
 ## Install from Source
 
@@ -93,10 +145,14 @@ Once registered, just talk to Claude naturally:
 - *"Show me my 10 most recent inbox emails"*
 - *"Read the email from Taylor about MLADS"*
 - *"Send an email to alice@example.com about the project update"*
-- *"Search my inbox for emails about the budget report"*
+- *"What's on my calendar this week?"*
+- *"Create a meeting with bob@example.com tomorrow at 2pm for 30 minutes"*
+- *"Save the attachment from that email to my Downloads folder"*
+- *"Create a task to review the quarterly report, due Friday, high importance"*
 - *"Mark that email as read and move it to archive"*
-- *"Reply to that email saying I'll join the meeting"*
-- *"List all my mail folders"*
+- *"What categories do I have? Set this email to 'Follow-up'"*
+- *"List my mail rules"*
+- *"Am I set as Out of Office?"*
 
 ## Why Not Microsoft Graph?
 
@@ -110,33 +166,29 @@ Once registered, just talk to Claude naturally:
 | Setup time | 30-60 minutes | 2 minutes |
 | Auth requirement | **Your own OAuth flow** | **Outlook is open** |
 
-## Extending
+## Contributing
 
-The architecture is designed to grow. The COM bridge is shared across tool modules, so adding new capabilities is straightforward.
-
-**Planned modules:**
-
-- **Calendar** — create events, check availability, manage meetings
-- **Contacts** — search address book, resolve recipients
-- **Tasks** — manage to-do items
-
-To add a new module, create `@mcp.tool()` functions in `server.py` that call through the existing `bridge.call()` pattern. Contributions welcome.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the branching strategy and development setup.
 
 ## Project Structure
 
 ```
 outlook-desktop-mcp/
   src/outlook_desktop_mcp/
-    server.py              # MCP server + all tool definitions
+    server.py              # MCP server + all 29 tool definitions
     com_bridge.py          # Async-to-COM threading bridge
     tools/
-      _folder_constants.py # Outlook folder enum values
+      _folder_constants.py # Outlook enums and constants
     utils/
-      formatting.py        # Email data extraction helpers
+      formatting.py        # Email, event, and task data extraction
       errors.py            # COM error formatting
   tests/
-    phase1_com_test.py     # Standalone COM validation
-    phase3_mcp_test.py     # MCP protocol integration test
+    phase1_com_test.py     # Email COM validation
+    phase3_mcp_test.py     # Email MCP test
+    calendar_com_test.py   # Calendar COM validation
+    calendar_mcp_test.py   # Calendar MCP test
+    extras_com_test.py     # Tasks/attachments/categories/rules/OOF COM test
+    extras_mcp_test.py     # Tasks/attachments/categories/rules/OOF MCP test
   outlook-desktop-mcp.cmd  # Windows launcher script
   pyproject.toml
 ```
