@@ -11,6 +11,7 @@ import sys
 import json
 import logging
 import os
+import re
 
 from mcp.server.fastmcp import FastMCP
 
@@ -75,6 +76,131 @@ def _clean(value: str) -> str:
     """Replace AppleScript's 'missing value' with empty string."""
     v = value.strip()
     return "" if v == "missing value" else v
+
+
+# --- UI Scraping for New Outlook for Mac ---
+# New Outlook for Mac stores Exchange/M365 mailbox data in the cloud and
+# does NOT expose it through the AppleScript `inbox` keyword (which only
+# reaches the empty local "On My Computer" inbox). The only way to access
+# Exchange messages is via macOS UI scripting (System Events), reading
+# the message list table visible in the Outlook window.
+
+
+_UI_MESSAGE_LIST_PATH = (
+    'tell application "System Events"\n'
+    '    tell process "Microsoft Outlook"\n'
+    '        tell window 1\n'
+    '            tell splitter group 1\n'
+    '                tell splitter group 1\n'
+    '                    tell splitter group 1\n'
+    '                        tell group 1\n'
+    '                            tell scroll area 1\n'
+    '                                tell table 1\n'
+)
+
+_UI_MESSAGE_LIST_END = (
+    '                                end tell\n'
+    '                            end tell\n'
+    '                        end tell\n'
+    '                    end tell\n'
+    '                end tell\n'
+    '            end tell\n'
+    '        end tell\n'
+    '    end tell\n'
+    'end tell'
+)
+
+
+async def _ui_list_messages(bridge_obj, count: int = 10) -> list[dict]:
+    """Read visible inbox messages via UI scripting (System Events).
+
+    This is the fallback for New Outlook for Mac where AppleScript's inbox
+    keyword only sees the empty local mailbox.
+    """
+    script = (
+        _UI_MESSAGE_LIST_PATH +
+        f'                                    set rowList to rows\n'
+        f'                                    set rowCount to count of rowList\n'
+        f'                                    set maxRows to rowCount\n'
+        f'                                    if maxRows > {count} then set maxRows to {count}\n'
+        f'                                    set output to ""\n'
+        f'                                    repeat with i from 1 to maxRows\n'
+        f'                                        set r to row i\n'
+        f'                                        try\n'
+        f'                                            set cellDesc to description of UI element 1 of r\n'
+        f'                                            set output to output & cellDesc & "{RECORD_DELIM}"\n'
+        f'                                        end try\n'
+        f'                                    end repeat\n'
+        f'                                    return output\n' +
+        _UI_MESSAGE_LIST_END
+    )
+
+    raw = await bridge_obj.run(script)
+    if not raw:
+        return []
+
+    results = []
+    for idx, record in enumerate(raw.split(RECORD_DELIM), start=1):
+        record = record.strip()
+        if not record:
+            continue
+        # Cell description format uses `,` + 4+ spaces as major field
+        # separators, while in-content commas have 0-1 trailing spaces.
+        # Structure: [Ulest,]    SENDER, SUBJECT,     TIME,    [FLAGS,]
+        fields = [f.strip() for f in re.split(r",\s{4,}", record)]
+
+        is_unread = False
+        has_attachment = False
+        # Strip status flags from the fields
+        cleaned = []
+        for f in fields:
+            if not f:
+                continue
+            if f == "Ulest":
+                is_unread = True
+                continue
+            if "Har filer" in f:
+                has_attachment = True
+                continue
+            if f == "Kategorisert" or f.startswith("Merket som"):
+                continue
+            cleaned.append(f)
+
+        # cleaned is typically: [SENDER_AND_SUBJECT, TIME]
+        # or [SENDER_AND_SUBJECT, TIME, extra...]
+        # SENDER_AND_SUBJECT is: "Sender, Subject" (comma + 1 space)
+        sender_subject = cleaned[0] if cleaned else ""
+        time_str = cleaned[1] if len(cleaned) > 1 else ""
+        # Strip trailing comma from time
+        time_str = time_str.rstrip(",").strip()
+
+        # Split sender from subject on first ", " (comma + single space)
+        # But skip thread-count prefixes like "2 meldinger, "
+        ss = sender_subject
+        # Remove thread count prefix
+        ss = re.sub(r"^\d+\s+meldinger,\s*", "", ss)
+        # Split on first ", " to get sender and subject
+        comma_pos = ss.find(", ")
+        if comma_pos > 0:
+            sender = ss[:comma_pos].strip()
+            subject = ss[comma_pos + 2:].strip()
+        else:
+            sender = ""
+            subject = ss.strip()
+
+        results.append({
+            "entry_id": f"ui-{idx}",
+            "subject": subject or "(could not parse subject)",
+            "sender": "",
+            "sender_name": sender,
+            "received_time": time_str,
+            "unread": is_unread,
+            "has_attachments": has_attachment,
+            "attachment_count": 1 if has_attachment else 0,
+            "_source": "ui_scraping",
+        })
+
+    return results
 
 
 # =====================================================================
@@ -201,28 +327,37 @@ end tell'''
 
     try:
         raw = await bridge.run(script)
-        if not raw:
-            return json.dumps([])
 
         results = []
-        for record in raw.split(RECORD_DELIM):
-            record = record.strip()
-            if not record:
-                continue
-            parts = record.split(DELIM)
-            if len(parts) < 7:
-                continue
-            att_count = int(parts[6]) if parts[6].strip().isdigit() else 0
-            results.append({
-                "entry_id": parts[0].strip(),
-                "subject": parts[1].strip() or "(no subject)",
-                "sender": parts[2].strip(),
-                "sender_name": parts[3].strip(),
-                "received_time": _clean(parts[4]),
-                "unread": parts[5].strip().lower() != "true",  # is_read -> unread
-                "has_attachments": att_count > 0,
-                "attachment_count": att_count,
-            })
+        if raw:
+            for record in raw.split(RECORD_DELIM):
+                record = record.strip()
+                if not record:
+                    continue
+                parts = record.split(DELIM)
+                if len(parts) < 7:
+                    continue
+                att_count = int(parts[6]) if parts[6].strip().isdigit() else 0
+                results.append({
+                    "entry_id": parts[0].strip(),
+                    "subject": parts[1].strip() or "(no subject)",
+                    "sender": parts[2].strip(),
+                    "sender_name": parts[3].strip(),
+                    "received_time": _clean(parts[4]),
+                    "unread": parts[5].strip().lower() != "true",  # is_read -> unread
+                    "has_attachments": att_count > 0,
+                    "attachment_count": att_count,
+                })
+
+        # Fallback: New Outlook for Mac keeps Exchange messages outside the
+        # AppleScript-visible mailbox. If the standard query returned nothing
+        # for the inbox, try reading the visible message list via UI scripting.
+        if not results and folder.lower().strip() in ("inbox", "innboks"):
+            try:
+                results = await _ui_list_messages(bridge, count)
+            except Exception:
+                pass  # UI scraping failed — return empty list
+
         return json.dumps(results, indent=2, default=str)
     except Exception as e:
         return f"Error listing emails: {e}"
