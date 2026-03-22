@@ -71,7 +71,21 @@ The server is structured as two parallel implementations with identical tool nam
 - **Microsoft Outlook for Mac** — version 16.x or later
 - **Python 3.12+**
 - **Outlook must be running** when the MCP server starts
-- The first time you run the server, macOS will prompt you to grant automation permissions to `osascript` for controlling Outlook
+
+#### Required macOS permissions
+
+The first time a tool runs, macOS will show **two permission prompts** that you must approve:
+
+1. **Privacy & Automation** — a system dialog asks: *"python3.12 wants to control Microsoft Outlook"*. Click **Allow** to let the server send AppleScript commands to Outlook.
+
+2. **Accessibility** — to read your Exchange/M365 inbox, the server uses macOS UI scripting (System Events). This requires Accessibility access for `python3.12`:
+   - Open **System Settings > Privacy & Security > Accessibility**
+   - Find **python3.12** in the list (it appears after the first prompt)
+   - Toggle it **on**
+
+   Without Accessibility enabled, calendar, tasks, and local folder tools will work, but listing Exchange inbox messages will return empty results.
+
+Both permissions are one-time setup — macOS remembers them for future sessions.
 
 ## Available Tools by Platform
 
