@@ -1,3 +1,3 @@
-from outlook_desktop_mcp.server import main
+from outlook_desktop_mcp.entrypoint import main
 
 main()
