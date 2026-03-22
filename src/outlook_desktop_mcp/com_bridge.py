@@ -54,7 +54,7 @@ class OutlookBridge:
             self._namespace = self._outlook.GetNamespace("MAPI")
             store_name = self._namespace.DefaultStore.DisplayName
             user_name = self._namespace.CurrentUser.Name
-            logger.info("COM thread ready. Store: %s, User: %s", store_name, user_name)
+            logger.debug("COM thread ready. Store: %s, User: %s", store_name, user_name)
             self._ready.set()
 
             while not self._shutdown.is_set():
@@ -90,7 +90,14 @@ class OutlookBridge:
         self._request_queue.put((func, args, kwargs, result_event, result_holder))
 
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, result_event.wait)
+        signaled = await loop.run_in_executor(
+            None, lambda: result_event.wait(timeout=60)
+        )
+        if not signaled:
+            raise TimeoutError(
+                "Outlook COM operation timed out after 60 seconds. "
+                "Outlook may be waiting for user input (e.g., a dialog box)."
+            )
 
         if "error" in result_holder:
             raise result_holder["error"]
