@@ -146,23 +146,33 @@ async def _ui_list_messages(bridge_obj, count: int = 10) -> list[dict]:
             continue
         # Cell description format uses `,` + 4+ spaces as major field
         # separators, while in-content commas have 0-1 trailing spaces.
-        # Structure: [Ulest,]    SENDER, SUBJECT,     TIME,    [FLAGS,]
+        # Structure: [UNREAD_FLAG,]    SENDER, SUBJECT,     TIME,    [FLAGS,]
         fields = [f.strip() for f in re.split(r",\s{4,}", record)]
 
         is_unread = False
         has_attachment = False
-        # Strip status flags from the fields
+        # Status tokens are locale-dependent. Match known tokens across
+        # languages so the parser works regardless of macOS language.
+        _UNREAD_TOKENS = {"Ulest", "Unread", "Non lu", "Nicht gelesen",
+                          "No leído", "未読", "未读"}
+        _ATTACHMENT_TOKENS = {"Har filer", "Has attachments", "Contient des fichiers",
+                              "Hat Anlagen", "Tiene archivos adjuntos", "添付ファイルあり",
+                              "有附件"}
+        _SKIP_PREFIXES = ("Merket som", "Marked as", "Marqué comme",
+                          "Markiert als", "Marcado como", "A ")
+        _CATEGORY_TOKENS = {"Kategorisert", "Categorized", "Catégorisé",
+                            "Kategorisiert", "Categorizado"}
         cleaned = []
         for f in fields:
             if not f:
                 continue
-            if f == "Ulest":
+            if f in _UNREAD_TOKENS:
                 is_unread = True
                 continue
-            if "Har filer" in f:
+            if any(tok in f for tok in _ATTACHMENT_TOKENS):
                 has_attachment = True
                 continue
-            if f == "Kategorisert" or f.startswith("Merket som"):
+            if f in _CATEGORY_TOKENS or any(f.startswith(p) for p in _SKIP_PREFIXES):
                 continue
             cleaned.append(f)
 
@@ -175,10 +185,10 @@ async def _ui_list_messages(bridge_obj, count: int = 10) -> list[dict]:
         time_str = time_str.rstrip(",").strip()
 
         # Split sender from subject on first ", " (comma + single space)
-        # But skip thread-count prefixes like "2 meldinger, "
+        # Remove thread/unread count prefixes like "2 messages, " or
+        # "1 unread message, " in any locale (pattern: digits + words + comma)
         ss = sender_subject
-        # Remove thread count prefix
-        ss = re.sub(r"^\d+\s+meldinger,\s*", "", ss)
+        ss = re.sub(r"^\d+\s+[\w\s]+,\s*", "", ss)
         # Split on first ", " to get sender and subject
         comma_pos = ss.find(", ")
         if comma_pos > 0:
@@ -352,7 +362,7 @@ end tell'''
         # Fallback: New Outlook for Mac keeps Exchange messages outside the
         # AppleScript-visible mailbox. If the standard query returned nothing
         # for the inbox, try reading the visible message list via UI scripting.
-        if not results and folder.lower().strip() in ("inbox", "innboks"):
+        if not results and folder.lower().strip() == "inbox":
             try:
                 results = await _ui_list_messages(bridge, count)
             except Exception:
