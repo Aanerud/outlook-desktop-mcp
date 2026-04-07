@@ -308,6 +308,54 @@ async def send_email(
 # TOOL 1b: create_draft
 # =====================================================================
 
+def _inject_after_body_tag(html: str, content: str) -> str:
+    """Insert content right after the opening <body> tag.
+
+    If no <body> tag is present, prepends content to html.
+    """
+    if not content:
+        return html
+    if not html:
+        return content
+    lower = html.lower()
+    idx = lower.find("<body")
+    if idx == -1:
+        return content + html
+    end = html.find(">", idx)
+    if end == -1:
+        return content + html
+    return html[: end + 1] + content + html[end + 1 :]
+
+
+def _plain_text_to_html(text: str) -> str:
+    """Convert plain text to a minimal HTML fragment, escaping special chars."""
+    if not text:
+        return ""
+    esc = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return "<div>" + esc.replace("\n", "<br>") + "</div>"
+
+
+def _read_signature_file(name: str) -> str:
+    """Load a named Outlook signature .htm file from %APPDATA%\\Microsoft\\Signatures."""
+    import os
+    appdata = os.environ.get("APPDATA", "")
+    if not appdata:
+        return ""
+    sig_dir = os.path.join(appdata, "Microsoft", "Signatures")
+    for ext in (".htm", ".html"):
+        sig_path = os.path.join(sig_dir, f"{name}{ext}")
+        if os.path.exists(sig_path):
+            for enc in ("utf-8", "utf-16", "cp1252", "latin-1"):
+                try:
+                    with open(sig_path, "r", encoding=enc) as f:
+                        return f.read()
+                except (UnicodeDecodeError, UnicodeError):
+                    continue
+                except Exception:
+                    return ""
+    return ""
+
+
 @mcp.tool()
 async def create_draft(
     to: str = "",
@@ -318,62 +366,198 @@ async def create_draft(
     html_body: str = "",
     account: str = "",
     display: bool = True,
+    reply_to_entry_id: str = "",
+    reply_all: bool = False,
+    signature: str = "",
+    include_signature: bool = True,
 ) -> str:
     """Save an email as a draft in Outlook without sending it.
 
-    Creates a draft in the Drafts folder. Optionally opens the compose window
-    immediately so you can add attachments, edit content, or send manually.
+    Can create a fresh standalone draft, OR a draft REPLY to an existing email
+    (preserving the conversation thread, recipients, and quoted message body).
+    Optionally inserts a signature: either the account's default signature, or
+    a named signature from the user's Outlook signature folder. Use
+    `list_signatures` to discover available signature names.
 
     Args:
-        to: Recipient email addresses, semicolon-separated. Can be left empty.
-        subject: Email subject line.
-        body: Plain-text body of the email.
+        to: Recipient email addresses, semicolon-separated. Ignored when
+            reply_to_entry_id is set (recipients come from the original mail).
+        subject: Email subject line. Ignored when reply_to_entry_id is set
+            (the original "RE: ..." subject is preserved).
+        body: Plain-text body of the email. Used when html_body is not provided.
         cc: CC recipients, semicolon-separated.
         bcc: BCC recipients, semicolon-separated.
-        html_body: Optional HTML body. When provided, Outlook renders HTML.
-        account: Account display name (substring) to associate the draft with.
-            Default: primary account. Use list_accounts to see available accounts.
+        html_body: Optional HTML body. Takes precedence over `body`.
+        account: Account display name (substring). Default: primary account.
+            Ignored when reply_to_entry_id is set (uses the receiving account).
         display: If True (default), opens the draft in Outlook's compose window
             immediately so you can add attachments or edit before sending.
+        reply_to_entry_id: If provided, creates a draft REPLY to this email.
+            The draft is properly threaded in the conversation, recipients are
+            populated from the original, and the quoted original body is
+            preserved below your new content.
+        reply_all: When replying, if True replies to all recipients (To + CC).
+            Default False replies only to the original sender.
+        signature: Name of a specific signature to insert (without file
+            extension). Use `list_signatures` to see what's available. If empty
+            and include_signature is True, the account's default signature
+            (as configured in Outlook) is used.
+        include_signature: If True (default), append the signature to the
+            draft. Set to False for a signature-free draft.
 
     Returns:
-        JSON with entry_id and subject on success, or an error string.
+        JSON with entry_id, subject, and is_reply on success, or an error string.
     """
-    def _create_draft(outlook, namespace, to, subject, body, cc, bcc, html_body, account, display):
-        mail = outlook.CreateItem(OL_MAIL_ITEM)
-        if account:
-            store = _require_store(namespace, account)
-            for acc in outlook.Session.Accounts:
-                if acc.DeliveryStore.StoreID == store.StoreID:
-                    mail._oleobj_.Invoke(*(64209, 0, 8, 0, acc))  # SendUsingAccount
-                    break
-        if to:
-            mail.To = to
-        if subject:
-            mail.Subject = subject
-        if body:
-            mail.Body = body
-        if cc:
-            mail.CC = cc
-        if bcc:
-            mail.BCC = bcc
+    def _create_draft(
+        outlook, namespace, to, subject, body, cc, bcc, html_body,
+        account, display, reply_to_entry_id, reply_all, signature, include_signature,
+    ):
+        is_reply = bool(reply_to_entry_id)
+
+        # ---- 1. Create the mail item: either a reply or a fresh item ----
+        if is_reply:
+            if account:
+                store = _require_store(namespace, account)
+                original = namespace.GetItemFromID(reply_to_entry_id, store.StoreID)
+            else:
+                original = namespace.GetItemFromID(reply_to_entry_id)
+            if err := _check_item_class(original, _OL_CLASS_MAIL, "mail item"):
+                return err
+            mail = original.ReplyAll() if reply_all else original.Reply()
+        else:
+            mail = outlook.CreateItem(OL_MAIL_ITEM)
+            if account:
+                store = _require_store(namespace, account)
+                for acc in outlook.Session.Accounts:
+                    if acc.DeliveryStore.StoreID == store.StoreID:
+                        mail._oleobj_.Invoke(*(64209, 0, 8, 0, acc))  # SendUsingAccount
+                        break
+            if to:
+                mail.To = to
+            if subject:
+                mail.Subject = subject
+            if cc:
+                mail.CC = cc
+            if bcc:
+                mail.BCC = bcc
+
+        # ---- 2. Resolve user-provided body to HTML ----
         if html_body:
-            mail.HTMLBody = html_body
-        mail.Save()             # saves to Drafts folder, does NOT send
+            user_html = html_body
+        else:
+            user_html = _plain_text_to_html(body)
+
+        # ---- 3. Acquire signature HTML ----
+        # If a named signature was requested, load from disk.
+        # Otherwise, if include_signature is True, ask Outlook to insert the
+        # default signature into the mail by accessing GetInspector.
+        named_sig_html = ""
+        used_default_sig = False
+        if include_signature:
+            if signature:
+                named_sig_html = _read_signature_file(signature)
+                if not named_sig_html:
+                    return f"Error creating draft: signature '{signature}' not found. Use list_signatures to see available signatures."
+            else:
+                try:
+                    _ = mail.GetInspector  # property access triggers default sig insertion
+                    used_default_sig = True
+                except Exception:
+                    used_default_sig = False
+
+        # ---- 4. Combine user content + signature + (quoted reply, if any) ----
+        # After step 1+3, mail.HTMLBody contains:
+        #   - reply + default sig: [default_sig + quoted_message]
+        #   - reply only:          [quoted_message]
+        #   - new + default sig:   [default_sig]
+        #   - new only:            [empty or minimal]
+        existing_html = mail.HTMLBody or ""
+
+        if signature and named_sig_html:
+            # Named signature: we manually combine. existing_html still contains
+            # the original quoted message (for replies) or is empty (for new).
+            combined = user_html + named_sig_html
+            if is_reply:
+                mail.HTMLBody = _inject_after_body_tag(existing_html, combined)
+            else:
+                mail.HTMLBody = combined if combined else existing_html
+        elif used_default_sig:
+            # Default sig already in existing_html. Inject user content above it.
+            if user_html:
+                mail.HTMLBody = _inject_after_body_tag(existing_html, user_html)
+            # else: leave as-is (default sig + possibly quoted text)
+        else:
+            # No signature at all
+            if is_reply:
+                if user_html:
+                    mail.HTMLBody = _inject_after_body_tag(existing_html, user_html)
+            else:
+                if user_html:
+                    mail.HTMLBody = user_html
+                elif body:
+                    mail.Body = body
+
+        # ---- 5. Save (to Drafts) and optionally open compose window ----
+        mail.Save()
         if display:
-            mail.Display(False) # False = non-modal, opens compose window
+            mail.Display(False)  # non-modal compose window
+
         return json.dumps({
             "status": "draft_created",
             "entry_id": mail.EntryID,
-            "subject": subject or "(no subject)",
+            "subject": mail.Subject or "(no subject)",
+            "is_reply": is_reply,
         })
 
     try:
         return await bridge.call(
-            _create_draft, to, subject, body, cc, bcc, html_body, account, display
+            _create_draft, to, subject, body, cc, bcc, html_body, account, display,
+            reply_to_entry_id, reply_all, signature, include_signature,
         )
     except Exception as e:
         return f"Error creating draft: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 1c: list_signatures
+# =====================================================================
+
+@mcp.tool()
+async def list_signatures() -> str:
+    """List Outlook signatures available on this machine.
+
+    Reads from the user's Outlook signature folder (on Windows:
+    %APPDATA%\\Microsoft\\Signatures). Each .htm file represents one signature.
+    Use the returned name with the `signature` parameter of `create_draft`
+    to insert a specific signature into a draft.
+
+    Returns:
+        JSON object with:
+            - signatures: sorted array of signature names (without extension)
+            - path: the signature folder that was scanned
+    """
+    import os
+    try:
+        appdata = os.environ.get("APPDATA", "")
+        if not appdata:
+            return json.dumps({"signatures": [], "error": "APPDATA env var not set"})
+        sig_dir = os.path.join(appdata, "Microsoft", "Signatures")
+        if not os.path.isdir(sig_dir):
+            return json.dumps({
+                "signatures": [],
+                "path": sig_dir,
+                "note": "Signatures folder does not exist",
+            })
+        sigs = set()
+        for entry in os.listdir(sig_dir):
+            full = os.path.join(sig_dir, entry)
+            if os.path.isfile(full):
+                name, ext = os.path.splitext(entry)
+                if ext.lower() in (".htm", ".html"):
+                    sigs.add(name)
+        return json.dumps({"signatures": sorted(sigs), "path": sig_dir})
+    except Exception as e:
+        return f"Error listing signatures: {e}"
 
 
 # =====================================================================

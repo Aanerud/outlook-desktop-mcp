@@ -285,19 +285,33 @@ async def create_draft(
     cc: str = "",
     bcc: str = "",
     html_body: str = "",
+    reply_to_entry_id: str = "",
+    reply_all: bool = False,
+    signature: str = "",
+    include_signature: bool = True,
 ) -> str:
     """Save an email as a draft in Outlook without sending it.
 
-    Creates a draft in the Drafts folder. The draft can be opened, edited,
-    and sent manually from Outlook.
+    Can create a fresh standalone draft, OR a draft REPLY to an existing email
+    (preserving the conversation thread, recipients, and quoted message body).
+    Optionally inserts a signature: either the user's default signature, or a
+    named signature. Use `list_signatures` to discover available signatures.
 
     Args:
-        to: Recipient email addresses, semicolon-separated. Can be left empty.
-        subject: Email subject line.
-        body: Plain-text body of the email.
+        to: Recipient email addresses, semicolon-separated. Ignored when
+            reply_to_entry_id is set (recipients come from the original mail).
+        subject: Email subject line. Ignored when reply_to_entry_id is set.
+        body: Plain-text body. Used when html_body is not provided.
         cc: CC recipients, semicolon-separated.
         bcc: BCC recipients, semicolon-separated.
-        html_body: Optional HTML body.
+        html_body: Optional HTML body. Takes precedence over `body`.
+        reply_to_entry_id: If provided, creates a draft REPLY to this email.
+            The draft is properly threaded and the quoted original is preserved.
+        reply_all: When replying, if True replies to all recipients (To + CC).
+        signature: Name of a specific Outlook signature to insert. Use
+            `list_signatures` to see available names. If empty and
+            include_signature is True, the default signature is used.
+        include_signature: If True (default), append the signature to the draft.
 
     Returns:
         JSON with message_id and subject on success, or an error string.
@@ -310,10 +324,72 @@ async def create_draft(
                 lines += f'make new {kind} at newMsg with properties {{email address:{{address:"{escape(addr)}"}}}}\n'
         return lines
 
+    # Resolve signature content via AppleScript (named or default)
+    sig_content = ""
+    if include_signature:
+        try:
+            if signature:
+                sig_script = (
+                    f'tell application "Microsoft Outlook"\n'
+                    f'    set sigContent to content of signature "{escape(signature)}"\n'
+                    f'    return sigContent\n'
+                    f'end tell'
+                )
+            else:
+                # Try to get the first signature as a "default" fallback,
+                # since AppleScript has no concept of an explicit default.
+                sig_script = (
+                    'tell application "Microsoft Outlook"\n'
+                    '    set sigList to every signature\n'
+                    '    if (count of sigList) > 0 then\n'
+                    '        return content of (item 1 of sigList)\n'
+                    '    else\n'
+                    '        return ""\n'
+                    '    end if\n'
+                    'end tell'
+                )
+            sig_content = (await bridge.run(sig_script)) or ""
+        except Exception:
+            sig_content = ""
+
+    if reply_to_entry_id:
+        # Build a draft reply: AppleScript "reply to" / "reply all to" creates
+        # the reply object; we set its content WITHOUT calling `send`.
+        reply_cmd = "reply all to" if reply_all else "reply to"
+        user_text = html_body or body or ""
+        # Combine: user content + (signature if any) + original quoted body
+        # AppleScript content joining is done by string concatenation.
+        sig_block = f'"{escape(sig_content)}" & return & return & ' if sig_content else ""
+        script = f'''tell application "Microsoft Outlook"
+    set m to message id {escape(reply_to_entry_id)}
+    set replyMsg to {reply_cmd} m
+    set content of replyMsg to "{escape(user_text)}" & return & return & {sig_block}content of replyMsg
+    set msgId to id of replyMsg
+    return msgId
+end tell'''
+        try:
+            msg_id = (await bridge.run(script)).strip()
+            return json.dumps({
+                "status": "draft_created",
+                "message_id": msg_id,
+                "subject": "(reply draft)",
+                "is_reply": True,
+            })
+        except Exception as e:
+            return f"Error creating draft: {e}"
+
+    # Fresh standalone draft
     to_lines = _recipient_lines(to, "to recipient")
     cc_lines = _recipient_lines(cc, "cc recipient") if cc else ""
     bcc_lines = _recipient_lines(bcc, "bcc recipient") if bcc else ""
-    content_prop = f'html content:"{escape(html_body)}"' if html_body else f'content:"{escape(body)}"'
+
+    if html_body:
+        full_body = html_body + (sig_content or "")
+        content_prop = f'html content:"{escape(full_body)}"'
+    else:
+        full_body = (body or "") + (("\n\n" + sig_content) if sig_content else "")
+        content_prop = f'content:"{escape(full_body)}"'
+
     subject_prop = f'subject:"{escape(subject)}"' if subject else 'subject:""'
 
     script = f'''tell application "Microsoft Outlook"
@@ -330,9 +406,45 @@ end tell'''
             "status": "draft_created",
             "message_id": msg_id,
             "subject": subject or "(no subject)",
+            "is_reply": False,
         })
     except Exception as e:
         return f"Error creating draft: {e}"
+
+
+# =====================================================================
+# TOOL 1c: list_signatures
+# =====================================================================
+
+@mcp.tool()
+async def list_signatures() -> str:
+    """List Outlook signatures available on this Mac.
+
+    Queries Microsoft Outlook via AppleScript for the names of all configured
+    signatures. Use the returned name with the `signature` parameter of
+    `create_draft` to insert a specific signature into a draft.
+
+    Returns:
+        JSON object with a `signatures` array of signature names.
+    """
+    script = (
+        'tell application "Microsoft Outlook"\n'
+        '    set sigNames to {}\n'
+        '    repeat with s in (every signature)\n'
+        '        set end of sigNames to name of s\n'
+        '    end repeat\n'
+        '    set AppleScript\'s text item delimiters to linefeed\n'
+        '    set out to sigNames as text\n'
+        '    set AppleScript\'s text item delimiters to ""\n'
+        '    return out\n'
+        'end tell'
+    )
+    try:
+        result = await bridge.run(script)
+        names = [line for line in (result or "").splitlines() if line.strip()]
+        return json.dumps({"signatures": sorted(names)})
+    except Exception as e:
+        return f"Error listing signatures: {e}"
 
 
 # =====================================================================
