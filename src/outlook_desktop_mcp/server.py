@@ -356,22 +356,41 @@ def _read_signature_file(name: str) -> str:
     return ""
 
 
+def _wrap_html_with_font(html_content: str, font_name: str, font_size: int) -> str:
+    """Wrap an HTML fragment in a <div> with explicit inline font styling.
+
+    Inline styles on the immediate parent of content are the highest-specificity
+    way to override Outlook's compose-template CSS. Used as belt-and-suspenders
+    alongside the CSS rule patching done by _override_html_body_font.
+    """
+    if not html_content or (not font_name and not font_size):
+        return html_content
+    parts = []
+    if font_name:
+        parts.append(f'font-family:"{font_name}",sans-serif')
+    if font_size:
+        parts.append(f"font-size:{font_size}pt")
+    style = ";".join(parts)
+    return f'<div style="{style}">{html_content}</div>'
+
+
 def _override_html_body_font(html: str, font_name: str, font_size: int) -> str:
     """Override the compose-body font in Outlook-generated HTML.
 
-    Outlook (Microsoft 365 2023+) switched its default compose font from
-    Calibri to Aptos 12pt.  This function patches the HTML that GetInspector
-    generates so that *new content typed in the compose area* uses the font
-    the caller requests.
+    Microsoft 365 (2023+) switched the default compose font from Calibri to
+    Aptos 12pt. The HTML that GetInspector generates is built by Word's HTML
+    exporter and uses Word-specific CSS selectors -- not just  body { }.
+    This function patches every CSS rule that controls the body / compose-area
+    font, so that the typed user content renders in the requested font.
 
-    Strategy (two layers so the override survives Outlook's CSS cascade):
-      1. Replace font-family / font-size inside the CSS  body { }  rule that
-         Outlook writes into the <style> block.
-      2. Add / update the matching inline  style=""  on the <body> tag itself
-         (inline styles beat stylesheet rules in Word's renderer).
+    Patched selectors (the ones Word/Outlook actually use for new mail):
+      - p.MsoNormal, li.MsoNormal, div.MsoNormal
+      - span.EmailStyle<N>           (the personal-compose style)
+      - .MsoChpDefault
+      - body
 
     The signature block and the quoted-reply section keep their own fonts
-    because they carry explicit per-element styles that are not touched here.
+    because they carry explicit per-element font styles that are not touched.
     """
     import re
 
@@ -380,48 +399,61 @@ def _override_html_body_font(html: str, font_name: str, font_size: int) -> str:
 
     result = html
 
-    # ── 1. Patch the  body { … }  rule in the <style> block ──────────────
-    def _patch_body_rule(m: re.Match) -> str:
-        rule = m.group(0)
-        if font_name:
-            if re.search(r"font-family\s*:", rule, re.IGNORECASE):
-                rule = re.sub(
-                    r"font-family\s*:\s*[^;}\n]+",
-                    f"font-family: {font_name}",
-                    rule,
-                    flags=re.IGNORECASE,
-                )
-            else:
-                rule = re.sub(r"\{", "{ font-family: " + font_name + ";", rule, count=1)
-        if font_size:
-            if re.search(r"font-size\s*:", rule, re.IGNORECASE):
-                rule = re.sub(
-                    r"font-size\s*:\s*[^;}\n]+",
-                    f"font-size: {font_size}pt",
-                    rule,
-                    flags=re.IGNORECASE,
-                )
-            else:
-                rule = re.sub(r"\{", "{ font-size: " + str(font_size) + "pt;", rule, count=1)
-        return rule
-
-    result = re.sub(
-        r"body\s*\{[^}]*\}",
-        _patch_body_rule,
-        result,
-        flags=re.IGNORECASE | re.DOTALL,
+    # CSS rule selectors that control the compose body font in Outlook HTML
+    target_pattern = re.compile(
+        r"(p\.MsoNormal|li\.MsoNormal|div\.MsoNormal|"
+        r"span\.EmailStyle\d+|\.MsoChpDefault|\bbody\b)",
+        re.IGNORECASE,
     )
 
-    # ── 2. Add / update inline style on the <body> tag ───────────────────
+    def _patch_rule_body(rule_body: str) -> str:
+        if font_name:
+            if re.search(r"font-family\s*:", rule_body, re.IGNORECASE):
+                rule_body = re.sub(
+                    r"font-family\s*:\s*[^;}\n]+",
+                    f'font-family:"{font_name}",sans-serif',
+                    rule_body,
+                    flags=re.IGNORECASE,
+                )
+            else:
+                rule_body = f'font-family:"{font_name}",sans-serif;' + rule_body
+        if font_size:
+            if re.search(r"font-size\s*:", rule_body, re.IGNORECASE):
+                rule_body = re.sub(
+                    r"font-size\s*:\s*[^;}\n]+",
+                    f"font-size:{font_size}.0pt",
+                    rule_body,
+                    flags=re.IGNORECASE,
+                )
+            else:
+                rule_body = f"font-size:{font_size}.0pt;" + rule_body
+        return rule_body
+
+    # ── 1. Patch every matching CSS rule in the <style> block ──────────────
+    def _patch_if_matches(m: "re.Match") -> str:
+        selector = m.group(1)
+        rule_body = m.group(2)
+        if target_pattern.search(selector):
+            return f"{selector}{{{_patch_rule_body(rule_body)}}}"
+        return m.group(0)
+
+    # Match top-level CSS rules: selector { properties }
+    result = re.sub(
+        r"([^{}@]+?)\{([^}]*)\}",
+        _patch_if_matches,
+        result,
+    )
+
+    # ── 2. Add / update inline style on the <body> tag (highest specificity) ──
     body_match = re.search(r"<body([^>]*)>", result, re.IGNORECASE)
     if body_match:
         attrs = body_match.group(1)
         new_parts: list[str] = []
         if font_name:
-            new_parts.append(f"font-family: {font_name}")
+            new_parts.append(f'font-family:"{font_name}",sans-serif')
         if font_size:
-            new_parts.append(f"font-size: {font_size}pt")
-        new_style_str = "; ".join(new_parts)
+            new_parts.append(f"font-size:{font_size}.0pt")
+        new_style_str = ";".join(new_parts)
 
         style_m = re.search(r'style\s*=\s*"([^"]*)"', attrs, re.IGNORECASE)
         if style_m:
@@ -430,7 +462,7 @@ def _override_html_body_font(html: str, font_name: str, font_size: int) -> str:
                 existing = re.sub(r"font-family\s*:\s*[^;]+;?\s*", "", existing, flags=re.IGNORECASE)
             if font_size:
                 existing = re.sub(r"font-size\s*:\s*[^;]+;?\s*", "", existing, flags=re.IGNORECASE)
-            combined = (new_style_str + "; " + existing.strip("; ")).strip("; ")
+            combined = (new_style_str + ";" + existing.strip("; ")).strip("; ")
             new_attrs = attrs[: style_m.start()] + f'style="{combined}"' + attrs[style_m.end() :]
         else:
             new_attrs = attrs + f' style="{new_style_str}"'
@@ -538,72 +570,99 @@ async def create_draft(
             if bcc:
                 mail.BCC = bcc
 
-        # ---- 2. Resolve user-provided body to HTML ----
+        # ---- 2. Capture pre-inspector HTML ──────────────────────────────
+        # For a reply, this is the quoted-message HTML (no signature yet).
+        # We need it later when the user supplies a NAMED signature, because
+        # in that case we cannot use the post-inspector HTML (which contains
+        # the unwanted default signature).
+        pre_inspector_html = mail.HTMLBody or ""
+
+        # ---- 3. Resolve user-provided body to HTML ──────────────────────
         if html_body:
             user_html = html_body
         else:
             user_html = _plain_text_to_html(body)
 
-        # ---- 3. Acquire signature HTML ----
-        # If a named signature was requested, load from disk.
-        # Otherwise, if include_signature is True, ask Outlook to insert the
-        # default signature into the mail by accessing GetInspector.
+        # Wrap user content with explicit inline font (highest CSS specificity)
+        if font_name or font_size:
+            user_html = _wrap_html_with_font(user_html, font_name, font_size)
+
+        # ---- 4. Load named signature file if requested ──────────────────
         named_sig_html = ""
-        used_default_sig = False
-        if include_signature:
-            if signature:
-                named_sig_html = _read_signature_file(signature)
-                if not named_sig_html:
-                    return f"Error creating draft: signature '{signature}' not found. Use list_signatures to see available signatures."
-            else:
-                try:
-                    _ = mail.GetInspector  # property access triggers default sig insertion
-                    used_default_sig = True
-                except Exception:
-                    used_default_sig = False
+        if include_signature and signature:
+            named_sig_html = _read_signature_file(signature)
+            if not named_sig_html:
+                return (
+                    f"Error creating draft: signature '{signature}' not found. "
+                    f"Use list_signatures to see available signatures."
+                )
 
-        # ---- 4. Combine user content + signature + (quoted reply, if any) ----
-        # After step 1+3, mail.HTMLBody contains:
-        #   - reply + default sig: [default_sig + quoted_message]
-        #   - reply only:          [quoted_message]
-        #   - new + default sig:   [default_sig]
-        #   - new only:            [empty or minimal]
-        existing_html = mail.HTMLBody or ""
+        # ---- 5. Always trigger Inspector before composing the body ──────
+        # This is the fix for the double-signature bug: when display=True,
+        # the very first call to Display() causes Outlook to insert the
+        # default signature.  By accessing GetInspector here we trigger that
+        # insertion *now*, *before* we set HTMLBody, so the subsequent
+        # HTMLBody assignment overwrites the default signature with our
+        # composition.  After that, Display() just shows the existing
+        # inspector and does not re-insert anything.
+        inspector_loaded = False
+        if include_signature or display:
+            try:
+                _ = mail.GetInspector  # property access; does not show window
+                inspector_loaded = True
+            except Exception:
+                inspector_loaded = False
 
-        if signature and named_sig_html:
-            # Named signature: we manually combine. existing_html still contains
-            # the original quoted message (for replies) or is empty (for new).
-            combined = user_html + named_sig_html
+        # ---- 6. Compose the final HTMLBody ──────────────────────────────
+        # Layout cases:
+        #   named sig + reply  : [user][named_sig] injected ABOVE quoted text
+        #   named sig + new    : [user][named_sig]
+        #   default sig + reply: [user] injected ABOVE [default_sig + quoted]
+        #   default sig + new  : [user] injected ABOVE [default_sig]
+        #   no sig + reply     : [user] injected ABOVE [quoted]
+        #   no sig + new       : [user]
+        post_inspector_html = mail.HTMLBody or ""
+
+        if include_signature and signature:
+            # NAMED signature wins.  We must NOT use the post-inspector HTML
+            # for the quoted portion -- it already contains the default sig
+            # that GetInspector inserted.  Use the pre-inspector HTML instead,
+            # which holds only the quoted text (or is empty for new mails).
+            combined_top = user_html + named_sig_html
             if is_reply:
-                mail.HTMLBody = _inject_after_body_tag(existing_html, combined)
+                mail.HTMLBody = _inject_after_body_tag(pre_inspector_html, combined_top)
             else:
-                mail.HTMLBody = combined if combined else existing_html
-        elif used_default_sig:
-            # Default sig already in existing_html. Inject user content above it.
+                mail.HTMLBody = combined_top if combined_top else post_inspector_html
+        elif include_signature and inspector_loaded:
+            # DEFAULT signature: GetInspector already wrote it into HTMLBody.
+            # Just inject the user content above whatever is there.
             if user_html:
-                mail.HTMLBody = _inject_after_body_tag(existing_html, user_html)
+                mail.HTMLBody = _inject_after_body_tag(post_inspector_html, user_html)
             # else: leave as-is (default sig + possibly quoted text)
         else:
-            # No signature at all
+            # NO signature (include_signature=False).  Discard whatever the
+            # inspector inserted and rebuild from the pre-inspector HTML.
             if is_reply:
+                base = pre_inspector_html
                 if user_html:
-                    mail.HTMLBody = _inject_after_body_tag(existing_html, user_html)
+                    mail.HTMLBody = _inject_after_body_tag(base, user_html)
+                else:
+                    mail.HTMLBody = base
             else:
                 if user_html:
                     mail.HTMLBody = user_html
                 elif body:
                     mail.Body = body
 
-        # ---- 5. Apply font override (if requested) ──────────────────────
-        # Microsoft 365 (2023+) defaults to Aptos 12pt in GetInspector-generated
-        # HTML, ignoring the user's personal Outlook font settings via COM.
-        # Patching the body CSS rule + <body> inline style forces the desired font.
+        # ---- 7. Apply font override on the assembled HTML ───────────────
+        # Patches CSS rules (p.MsoNormal, span.EmailStyleN, .MsoChpDefault, body)
+        # in the generated HTML so the compose body uses the requested font.
         if font_name or font_size:
             current_html = mail.HTMLBody
             if current_html:
                 mail.HTMLBody = _override_html_body_font(current_html, font_name, font_size)
 
-        # ---- 6. Save (to Drafts) and optionally open compose window ----
+        # ---- 8. Save (to Drafts) and optionally open compose window ────
         mail.Save()
         if display:
             mail.Display(False)  # non-modal compose window
