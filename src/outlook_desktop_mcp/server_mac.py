@@ -274,6 +274,68 @@ end tell'''
 
 
 # =====================================================================
+# TOOL 1b: create_draft
+# =====================================================================
+
+@mcp.tool()
+async def create_draft(
+    to: str = "",
+    subject: str = "",
+    body: str = "",
+    cc: str = "",
+    bcc: str = "",
+    html_body: str = "",
+) -> str:
+    """Save an email as a draft in Outlook without sending it.
+
+    Creates a draft in the Drafts folder. The draft can be opened, edited,
+    and sent manually from Outlook.
+
+    Args:
+        to: Recipient email addresses, semicolon-separated. Can be left empty.
+        subject: Email subject line.
+        body: Plain-text body of the email.
+        cc: CC recipients, semicolon-separated.
+        bcc: BCC recipients, semicolon-separated.
+        html_body: Optional HTML body.
+
+    Returns:
+        JSON with message_id and subject on success, or an error string.
+    """
+    def _recipient_lines(addresses: str, kind: str) -> str:
+        lines = ""
+        for addr in addresses.split(";"):
+            addr = addr.strip()
+            if addr:
+                lines += f'make new {kind} at newMsg with properties {{email address:{{address:"{escape(addr)}"}}}}\n'
+        return lines
+
+    to_lines = _recipient_lines(to, "to recipient")
+    cc_lines = _recipient_lines(cc, "cc recipient") if cc else ""
+    bcc_lines = _recipient_lines(bcc, "bcc recipient") if bcc else ""
+    content_prop = f'html content:"{escape(html_body)}"' if html_body else f'content:"{escape(body)}"'
+    subject_prop = f'subject:"{escape(subject)}"' if subject else 'subject:""'
+
+    script = f'''tell application "Microsoft Outlook"
+    set newMsg to make new outgoing message with properties {{{subject_prop}, {content_prop}}}
+    {to_lines}{cc_lines}{bcc_lines}
+    set msgId to id of newMsg
+    return msgId
+end tell'''
+    # Note: no `send newMsg` call → message stays as a draft
+
+    try:
+        msg_id = (await bridge.run(script)).strip()
+        return json.dumps({
+            "status": "draft_created",
+            "message_id": msg_id,
+            "subject": subject or "(no subject)",
+        })
+    except Exception as e:
+        return f"Error creating draft: {e}"
+
+
+# =====================================================================
 # TOOL 2: list_emails
 # =====================================================================
 

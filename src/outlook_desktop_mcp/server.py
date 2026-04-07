@@ -305,6 +305,78 @@ async def send_email(
 
 
 # =====================================================================
+# TOOL 1b: create_draft
+# =====================================================================
+
+@mcp.tool()
+async def create_draft(
+    to: str = "",
+    subject: str = "",
+    body: str = "",
+    cc: str = "",
+    bcc: str = "",
+    html_body: str = "",
+    account: str = "",
+    display: bool = True,
+) -> str:
+    """Save an email as a draft in Outlook without sending it.
+
+    Creates a draft in the Drafts folder. Optionally opens the compose window
+    immediately so you can add attachments, edit content, or send manually.
+
+    Args:
+        to: Recipient email addresses, semicolon-separated. Can be left empty.
+        subject: Email subject line.
+        body: Plain-text body of the email.
+        cc: CC recipients, semicolon-separated.
+        bcc: BCC recipients, semicolon-separated.
+        html_body: Optional HTML body. When provided, Outlook renders HTML.
+        account: Account display name (substring) to associate the draft with.
+            Default: primary account. Use list_accounts to see available accounts.
+        display: If True (default), opens the draft in Outlook's compose window
+            immediately so you can add attachments or edit before sending.
+
+    Returns:
+        JSON with entry_id and subject on success, or an error string.
+    """
+    def _create_draft(outlook, namespace, to, subject, body, cc, bcc, html_body, account, display):
+        mail = outlook.CreateItem(OL_MAIL_ITEM)
+        if account:
+            store = _require_store(namespace, account)
+            for acc in outlook.Session.Accounts:
+                if acc.DeliveryStore.StoreID == store.StoreID:
+                    mail._oleobj_.Invoke(*(64209, 0, 8, 0, acc))  # SendUsingAccount
+                    break
+        if to:
+            mail.To = to
+        if subject:
+            mail.Subject = subject
+        if body:
+            mail.Body = body
+        if cc:
+            mail.CC = cc
+        if bcc:
+            mail.BCC = bcc
+        if html_body:
+            mail.HTMLBody = html_body
+        mail.Save()             # saves to Drafts folder, does NOT send
+        if display:
+            mail.Display(False) # False = non-modal, opens compose window
+        return json.dumps({
+            "status": "draft_created",
+            "entry_id": mail.EntryID,
+            "subject": subject or "(no subject)",
+        })
+
+    try:
+        return await bridge.call(
+            _create_draft, to, subject, body, cc, bcc, html_body, account, display
+        )
+    except Exception as e:
+        return f"Error creating draft: {format_com_error(e)}"
+
+
+# =====================================================================
 # TOOL 2: list_emails
 # =====================================================================
 
