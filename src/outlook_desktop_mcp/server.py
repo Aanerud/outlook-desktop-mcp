@@ -356,6 +356,90 @@ def _read_signature_file(name: str) -> str:
     return ""
 
 
+def _override_html_body_font(html: str, font_name: str, font_size: int) -> str:
+    """Override the compose-body font in Outlook-generated HTML.
+
+    Outlook (Microsoft 365 2023+) switched its default compose font from
+    Calibri to Aptos 12pt.  This function patches the HTML that GetInspector
+    generates so that *new content typed in the compose area* uses the font
+    the caller requests.
+
+    Strategy (two layers so the override survives Outlook's CSS cascade):
+      1. Replace font-family / font-size inside the CSS  body { }  rule that
+         Outlook writes into the <style> block.
+      2. Add / update the matching inline  style=""  on the <body> tag itself
+         (inline styles beat stylesheet rules in Word's renderer).
+
+    The signature block and the quoted-reply section keep their own fonts
+    because they carry explicit per-element styles that are not touched here.
+    """
+    import re
+
+    if not html or (not font_name and not font_size):
+        return html
+
+    result = html
+
+    # ── 1. Patch the  body { … }  rule in the <style> block ──────────────
+    def _patch_body_rule(m: re.Match) -> str:
+        rule = m.group(0)
+        if font_name:
+            if re.search(r"font-family\s*:", rule, re.IGNORECASE):
+                rule = re.sub(
+                    r"font-family\s*:\s*[^;}\n]+",
+                    f"font-family: {font_name}",
+                    rule,
+                    flags=re.IGNORECASE,
+                )
+            else:
+                rule = re.sub(r"\{", "{ font-family: " + font_name + ";", rule, count=1)
+        if font_size:
+            if re.search(r"font-size\s*:", rule, re.IGNORECASE):
+                rule = re.sub(
+                    r"font-size\s*:\s*[^;}\n]+",
+                    f"font-size: {font_size}pt",
+                    rule,
+                    flags=re.IGNORECASE,
+                )
+            else:
+                rule = re.sub(r"\{", "{ font-size: " + str(font_size) + "pt;", rule, count=1)
+        return rule
+
+    result = re.sub(
+        r"body\s*\{[^}]*\}",
+        _patch_body_rule,
+        result,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # ── 2. Add / update inline style on the <body> tag ───────────────────
+    body_match = re.search(r"<body([^>]*)>", result, re.IGNORECASE)
+    if body_match:
+        attrs = body_match.group(1)
+        new_parts: list[str] = []
+        if font_name:
+            new_parts.append(f"font-family: {font_name}")
+        if font_size:
+            new_parts.append(f"font-size: {font_size}pt")
+        new_style_str = "; ".join(new_parts)
+
+        style_m = re.search(r'style\s*=\s*"([^"]*)"', attrs, re.IGNORECASE)
+        if style_m:
+            existing = style_m.group(1)
+            if font_name:
+                existing = re.sub(r"font-family\s*:\s*[^;]+;?\s*", "", existing, flags=re.IGNORECASE)
+            if font_size:
+                existing = re.sub(r"font-size\s*:\s*[^;]+;?\s*", "", existing, flags=re.IGNORECASE)
+            combined = (new_style_str + "; " + existing.strip("; ")).strip("; ")
+            new_attrs = attrs[: style_m.start()] + f'style="{combined}"' + attrs[style_m.end() :]
+        else:
+            new_attrs = attrs + f' style="{new_style_str}"'
+
+        result = result[: body_match.start()] + f"<body{new_attrs}>" + result[body_match.end() :]
+
+    return result
+
+
 @mcp.tool()
 async def create_draft(
     to: str = "",
@@ -370,6 +454,8 @@ async def create_draft(
     reply_all: bool = False,
     signature: str = "",
     include_signature: bool = True,
+    font_name: str = "",
+    font_size: int = 0,
 ) -> str:
     """Save an email as a draft in Outlook without sending it.
 
@@ -378,6 +464,12 @@ async def create_draft(
     Optionally inserts a signature: either the account's default signature, or
     a named signature from the user's Outlook signature folder. Use
     `list_signatures` to discover available signature names.
+
+    NOTE ON FONTS: Microsoft 365 (2023+) changed the default compose font to
+    Aptos 12pt, overriding personal Outlook settings when drafts are created via
+    COM automation. Use `font_name` and `font_size` to enforce a specific font
+    for the draft body (e.g. font_name="Arial", font_size=10). The signature
+    and quoted-reply sections keep their own fonts unchanged.
 
     Args:
         to: Recipient email addresses, semicolon-separated. Ignored when
@@ -404,6 +496,10 @@ async def create_draft(
             (as configured in Outlook) is used.
         include_signature: If True (default), append the signature to the
             draft. Set to False for a signature-free draft.
+        font_name: Override the body font-family (e.g. "Arial", "Calibri").
+            Leave empty to use whatever Outlook's compose template provides.
+        font_size: Override the body font size in points (e.g. 10, 11, 12).
+            Leave 0 to use whatever Outlook's compose template provides.
 
     Returns:
         JSON with entry_id, subject, and is_reply on success, or an error string.
@@ -411,6 +507,7 @@ async def create_draft(
     def _create_draft(
         outlook, namespace, to, subject, body, cc, bcc, html_body,
         account, display, reply_to_entry_id, reply_all, signature, include_signature,
+        font_name, font_size,
     ):
         is_reply = bool(reply_to_entry_id)
 
@@ -497,7 +594,16 @@ async def create_draft(
                 elif body:
                     mail.Body = body
 
-        # ---- 5. Save (to Drafts) and optionally open compose window ----
+        # ---- 5. Apply font override (if requested) ──────────────────────
+        # Microsoft 365 (2023+) defaults to Aptos 12pt in GetInspector-generated
+        # HTML, ignoring the user's personal Outlook font settings via COM.
+        # Patching the body CSS rule + <body> inline style forces the desired font.
+        if font_name or font_size:
+            current_html = mail.HTMLBody
+            if current_html:
+                mail.HTMLBody = _override_html_body_font(current_html, font_name, font_size)
+
+        # ---- 6. Save (to Drafts) and optionally open compose window ----
         mail.Save()
         if display:
             mail.Display(False)  # non-modal compose window
@@ -513,6 +619,7 @@ async def create_draft(
         return await bridge.call(
             _create_draft, to, subject, body, cc, bcc, html_body, account, display,
             reply_to_entry_id, reply_all, signature, include_signature,
+            font_name, font_size,
         )
     except Exception as e:
         return f"Error creating draft: {format_com_error(e)}"
