@@ -143,7 +143,13 @@ def _require_store(namespace, account: str = ""):
 
 def _walk_folders(parent, name_lower: str):
     """Recursively search subfolders of parent for a folder matching name_lower."""
-    for i in range(parent.Folders.Count):
+    try:
+        # Some Exchange/shared-mailbox folder types raise COMError on .Count;
+        # treat them as empty to avoid crashing the traversal.
+        count = parent.Folders.Count
+    except Exception:
+        return None
+    for i in range(count):
         try:
             f = parent.Folders.Item(i + 1)
             if f.Name.lower() == name_lower:
@@ -164,6 +170,7 @@ def _resolve_folder(namespace, folder_name: str, store=None):
     2. Built-in Outlook folder enum (inbox, sent, deleted, etc.)
     3. Root-level folder name match (fast path)
     4. Recursive depth-first search of entire folder tree (fallback)
+    5. Search folders (virtual/search folders not in regular tree)
     """
     folder_name = folder_name.strip()
     store = store or namespace.DefaultStore
@@ -177,7 +184,11 @@ def _resolve_folder(namespace, folder_name: str, store=None):
         for part in parts[1:]:
             part_lower = part.lower()
             found = None
-            for i in range(current.Folders.Count):
+            try:
+                count = current.Folders.Count
+            except Exception:
+                return None
+            for i in range(count):
                 try:
                     f = current.Folders.Item(i + 1)
                     if f.Name.lower() == part_lower:
@@ -207,7 +218,25 @@ def _resolve_folder(namespace, folder_name: str, store=None):
             continue
 
     # Recursive fallback: search entire folder tree
-    return _walk_folders(root, folder_lower)
+    result = _walk_folders(root, folder_lower)
+    if result:
+        return result
+
+    # Search folders fallback: virtual folders (e.g. "Flagged", "To-Do") are
+    # not in the regular folder tree — access via Store.GetSearchFolders()
+    try:
+        search_folders = store.GetSearchFolders()
+        for i in range(search_folders.Count):
+            try:
+                f = search_folders.Item(i + 1)
+                if f.Name.lower() == folder_lower:
+                    return f
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return None
 
 
 # =====================================================================
