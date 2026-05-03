@@ -78,6 +78,69 @@ def _clean(value: str) -> str:
     return "" if v == "missing value" else v
 
 
+def _apple_date_from_parts(parts: list[str], start_index: int) -> datetime | None:
+    """Build a datetime from numeric AppleScript date parts."""
+    try:
+        values = [int(parts[start_index + i].strip()) for i in range(6)]
+        return datetime(*values)
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def _parse_range_start(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+def _parse_range_end(value: str) -> datetime:
+    dt = datetime.fromisoformat(value)
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value.strip()):
+        return dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return dt
+
+
+def _parse_calendar_records(
+    raw: str,
+    start: datetime,
+    end: datetime,
+    count: int,
+    query: str = "",
+) -> list[dict]:
+    query_lower = query.lower()
+    results = []
+    for record in raw.split(RECORD_DELIM):
+        record = record.strip()
+        if not record:
+            continue
+        parts = record.split(DELIM)
+        if len(parts) < 19:
+            continue
+        subject = parts[1].strip() or "(no subject)"
+        if query_lower and query_lower not in subject.lower():
+            continue
+        start_dt = _apple_date_from_parts(parts, 7)
+        end_dt = _apple_date_from_parts(parts, 13)
+        if start_dt and not (start <= start_dt <= end):
+            continue
+        item = {
+            "entry_id": parts[0].strip(),
+            "subject": subject,
+            "start": parts[2].strip(),
+            "end": parts[3].strip(),
+            "location": _clean(parts[4]),
+            "organizer": _clean(parts[5]),
+            "all_day": parts[6].strip().lower() == "true",
+        }
+        if start_dt and end_dt:
+            item["duration"] = int((end_dt - start_dt).total_seconds() / 60)
+        item["_start_dt"] = start_dt or datetime.max
+        results.append(item)
+
+    results.sort(key=lambda item: item["_start_dt"])
+    for item in results:
+        item.pop("_start_dt", None)
+    return results[:count]
+
+
 # --- UI Scraping for New Outlook for Mac ---
 # New Outlook for Mac stores Exchange/M365 mailbox data in the cloud and
 # does NOT expose it through the AppleScript `inbox` keyword (which only
@@ -1137,25 +1200,24 @@ async def list_events(
     Returns:
         JSON array of event summary objects.
     """
-    start = datetime.fromisoformat(start_date) if start_date else datetime.now()
-    end = datetime.fromisoformat(end_date) if end_date else start + timedelta(days=7)
-
-    # Fetch more than needed, filter by date in Python since AppleScript
-    # whose-clause date filtering can be unreliable in Outlook for Mac.
-    fetch_limit = count * 3  # overfetch to account for out-of-range events
+    count = min(max(1, count), 200)
+    start = _parse_range_start(start_date) if start_date else datetime.now()
+    end = _parse_range_end(end_date) if end_date else start + timedelta(days=7)
 
     script = f'''tell application "Microsoft Outlook"
-    set evts to calendar events
+    set rangeStart to {format_date(start)}
+    set rangeEnd to {format_date(end)}
+    set evts to calendar events whose start time is greater than or equal to rangeStart and start time is less than or equal to rangeEnd
     set evtCount to count of evts
-    set maxFetch to {fetch_limit}
-    if evtCount < maxFetch then set maxFetch to evtCount
     set output to ""
-    repeat with i from 1 to maxFetch
+    repeat with i from 1 to evtCount
         set e to item i of evts
         set eid to id of e
         set esubject to subject of e
-        set estart to start time of e as string
-        set eend to end time of e as string
+        set estartDate to start time of e
+        set eendDate to end time of e
+        set estart to estartDate as string
+        set eend to eendDate as string
         set elocation to ""
         try
             set elocation to location of e
@@ -1165,7 +1227,7 @@ async def list_events(
             set eorganizer to organizer of e
         end try
         set eallday to all day flag of e
-        set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{RECORD_DELIM}"
+        set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{DELIM}" & (year of estartDate as integer) & "{DELIM}" & (month of estartDate as integer) & "{DELIM}" & (day of estartDate as integer) & "{DELIM}" & (hours of estartDate as integer) & "{DELIM}" & (minutes of estartDate as integer) & "{DELIM}" & (seconds of estartDate as integer) & "{DELIM}" & (year of eendDate as integer) & "{DELIM}" & (month of eendDate as integer) & "{DELIM}" & (day of eendDate as integer) & "{DELIM}" & (hours of eendDate as integer) & "{DELIM}" & (minutes of eendDate as integer) & "{DELIM}" & (seconds of eendDate as integer) & "{RECORD_DELIM}"
     end repeat
     return output
 end tell'''
@@ -1175,23 +1237,7 @@ end tell'''
         if not raw:
             return json.dumps([])
 
-        results = []
-        for record in raw.split(RECORD_DELIM):
-            record = record.strip()
-            if not record:
-                continue
-            parts = record.split(DELIM)
-            if len(parts) < 7:
-                continue
-            results.append({
-                "entry_id": parts[0].strip(),
-                "subject": parts[1].strip() or "(no subject)",
-                "start": parts[2].strip(),
-                "end": parts[3].strip(),
-                "location": _clean(parts[4]),
-                "organizer": _clean(parts[5]),
-                "all_day": parts[6].strip().lower() == "true",
-            })
+        results = _parse_calendar_records(raw, start, end, count)
         return json.dumps(results, indent=2, default=str)
     except Exception as e:
         return f"Error listing events: {e}"
@@ -1523,20 +1569,24 @@ async def search_events(
     Returns:
         JSON array of matching event summaries.
     """
-    safe_query = escape(query)
+    count = min(max(1, count), 200)
+    start = _parse_range_start(start_date) if start_date else datetime.now() - timedelta(days=30)
+    end = _parse_range_end(end_date) if end_date else datetime.now() + timedelta(days=30)
 
     script = f'''tell application "Microsoft Outlook"
-    set evts to calendar events whose subject contains "{safe_query}"
+    set rangeStart to {format_date(start)}
+    set rangeEnd to {format_date(end)}
+    set evts to calendar events whose start time is greater than or equal to rangeStart and start time is less than or equal to rangeEnd
     set evtCount to count of evts
-    set maxCount to {count}
-    if evtCount < maxCount then set maxCount to evtCount
     set output to ""
-    repeat with i from 1 to maxCount
+    repeat with i from 1 to evtCount
         set e to item i of evts
         set eid to id of e
         set esubject to subject of e
-        set estart to start time of e as string
-        set eend to end time of e as string
+        set estartDate to start time of e
+        set eendDate to end time of e
+        set estart to estartDate as string
+        set eend to eendDate as string
         set elocation to ""
         try
             set elocation to location of e
@@ -1546,7 +1596,7 @@ async def search_events(
             set eorganizer to organizer of e
         end try
         set eallday to all day flag of e
-        set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{RECORD_DELIM}"
+        set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{DELIM}" & (year of estartDate as integer) & "{DELIM}" & (month of estartDate as integer) & "{DELIM}" & (day of estartDate as integer) & "{DELIM}" & (hours of estartDate as integer) & "{DELIM}" & (minutes of estartDate as integer) & "{DELIM}" & (seconds of estartDate as integer) & "{DELIM}" & (year of eendDate as integer) & "{DELIM}" & (month of eendDate as integer) & "{DELIM}" & (day of eendDate as integer) & "{DELIM}" & (hours of eendDate as integer) & "{DELIM}" & (minutes of eendDate as integer) & "{DELIM}" & (seconds of eendDate as integer) & "{RECORD_DELIM}"
     end repeat
     return output
 end tell'''
@@ -1556,23 +1606,7 @@ end tell'''
         if not raw:
             return json.dumps([])
 
-        results = []
-        for record in raw.split(RECORD_DELIM):
-            record = record.strip()
-            if not record:
-                continue
-            parts = record.split(DELIM)
-            if len(parts) < 7:
-                continue
-            results.append({
-                "entry_id": parts[0].strip(),
-                "subject": parts[1].strip() or "(no subject)",
-                "start": parts[2].strip(),
-                "end": parts[3].strip(),
-                "location": _clean(parts[4]),
-                "organizer": _clean(parts[5]),
-                "all_day": parts[6].strip().lower() == "true",
-            })
+        results = _parse_calendar_records(raw, start, end, count, query)
         return json.dumps(results, indent=2, default=str)
     except Exception as e:
         return f"Error searching events: {e}"
