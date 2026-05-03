@@ -19,11 +19,10 @@ def escape(text: str) -> str:
 def format_date(dt: datetime) -> str:
     """Convert a Python datetime to an AppleScript date string.
 
-    Returns a string like: date "Sunday, March 22, 2026 at 2:00:00 PM"
-    AppleScript parses dates based on the system locale, so we use a
-    locale-friendly format that osascript can interpret.
+    Avoid ISO-like strings such as "2026-03-22 14:00:00": AppleScript may
+    reinterpret them according to the user's date preferences.
     """
-    return f'date "{dt.strftime("%Y-%m-%d %H:%M:%S")}"'
+    return f'date "{dt.day} {dt.strftime("%B %Y at %H:%M:%S")}"'
 
 
 def parse_date(text: str) -> str:
