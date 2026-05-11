@@ -305,7 +305,78 @@ async def send_email(
 
 
 # =====================================================================
-# TOOL 2: list_emails
+# TOOL 2: create_draft_email
+# =====================================================================
+
+@mcp.tool()
+async def create_draft_email(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = "",
+    bcc: str = "",
+    html_body: str = "",
+    account: str = "",
+) -> str:
+    """Create an email draft without sending it.
+
+    Creates a new mail item, populates recipients, subject, and body, then saves
+    it to Outlook Drafts. This is the safe alternative to send_email when a user
+    or agent needs to review the message before sending.
+
+    Args:
+        to: One or more recipient email addresses, separated by semicolons.
+        subject: The email subject line.
+        body: The plain-text body of the email. If html_body is also provided,
+            both are set and Outlook will prefer the HTML version.
+        cc: Optional. CC recipients, separated by semicolons.
+        bcc: Optional. BCC recipients, separated by semicolons.
+        html_body: Optional. HTML-formatted body.
+        account: Optional. Account display name (or substring) to save from.
+            Default: primary account. Use list_accounts to see available accounts.
+
+    Returns:
+        JSON with status, entry_id, subject, recipients, and account information,
+        or an error.
+    """
+    def _draft(outlook, namespace, to, subject, body, cc, bcc, html_body, account):
+        store = _require_store(namespace, account)
+        mail = outlook.CreateItem(OL_MAIL_ITEM)
+        send_account = None
+        for acc in outlook.Session.Accounts:
+            if acc.DeliveryStore.StoreID == store.StoreID:
+                send_account = acc
+                mail._oleobj_.Invoke(*(64209, 0, 8, 0, acc))  # SendUsingAccount
+                break
+        mail.To = to
+        mail.Subject = subject
+        mail.Body = body
+        if cc:
+            mail.CC = cc
+        if bcc:
+            mail.BCC = bcc
+        if html_body:
+            mail.HTMLBody = html_body
+        mail.Save()
+        return json.dumps({
+            "status": "draft_created",
+            "entry_id": mail.EntryID,
+            "subject": mail.Subject,
+            "to": mail.To,
+            "cc": mail.CC,
+            "bcc": mail.BCC,
+            "account": send_account.DisplayName if send_account else store.DisplayName,
+            "folder": "Drafts",
+        }, indent=2, default=str)
+
+    try:
+        return await bridge.call(_draft, to, subject, body, cc, bcc, html_body, account)
+    except Exception as e:
+        return f"Error creating draft email: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 3: list_emails
 # =====================================================================
 
 @mcp.tool()
@@ -621,7 +692,71 @@ async def reply_email(
 
 
 # =====================================================================
-# TOOL 8: list_folders
+# TOOL 8: create_draft_reply
+# =====================================================================
+
+@mcp.tool()
+async def create_draft_reply(
+    entry_id: str,
+    body: str,
+    reply_all: bool = False,
+    html_body: str = "",
+    account: str = "",
+) -> str:
+    """Create a reply draft without sending it.
+
+    Creates a reply or reply-all item, prepends the supplied body above the
+    original message thread, saves it to Drafts, and returns the draft EntryID.
+    This is the safe alternative to reply_email for review-before-send flows.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the email to reply to.
+        body: Plain-text reply content. Used when html_body is not provided.
+        reply_all: If true, reply to all recipients (sender + all CC/To).
+            If false (default), reply only to the sender.
+        html_body: Optional. HTML-formatted reply content to prepend above the
+            original message. When provided, Outlook renders the draft as HTML.
+        account: Optional. Account display name (or substring). Only needed
+            if entry_id is ambiguous across stores.
+
+    Returns:
+        JSON with status, draft entry_id, original subject, reply_all flag, and
+        recipients, or an error.
+    """
+    def _draft_reply(outlook, namespace, entry_id, body, reply_all, html_body, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(entry_id, store.StoreID)
+        else:
+            item = namespace.GetItemFromID(entry_id)
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
+            return err
+        original_subject = item.Subject
+        reply_item = item.ReplyAll() if reply_all else item.Reply()
+        if html_body:
+            reply_item.HTMLBody = html_body + "<br><br>" + reply_item.HTMLBody
+        else:
+            reply_item.Body = body + "\n\n" + reply_item.Body
+        reply_item.Save()
+        return json.dumps({
+            "status": "draft_reply_created",
+            "entry_id": reply_item.EntryID,
+            "original_subject": original_subject,
+            "subject": reply_item.Subject,
+            "to": reply_item.To,
+            "cc": reply_item.CC,
+            "reply_all": reply_all,
+            "folder": "Drafts",
+        }, indent=2, default=str)
+
+    try:
+        return await bridge.call(_draft_reply, entry_id, body, reply_all, html_body, account)
+    except Exception as e:
+        return f"Error creating draft reply: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 9: list_folders
 # =====================================================================
 
 @mcp.tool()
