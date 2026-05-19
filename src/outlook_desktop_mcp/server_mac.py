@@ -274,7 +274,62 @@ end tell'''
 
 
 # =====================================================================
-# TOOL 2: list_emails
+# TOOL 2: create_draft_email
+# =====================================================================
+
+@mcp.tool()
+async def create_draft_email(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = "",
+    bcc: str = "",
+    html_body: str = "",
+) -> str:
+    """Create an email draft without sending it.
+
+    Creates a new outgoing message, populates recipients, subject, and body,
+    then saves it to Outlook Drafts for review.
+    """
+    def _recipient_lines(addresses: str, kind: str) -> str:
+        lines = ""
+        for addr in addresses.split(";"):
+            addr = addr.strip()
+            if addr:
+                lines += f'make new {kind} at newMsg with properties {{email address:{{address:"{escape(addr)}"}}}}\n'
+        return lines
+
+    to_lines = _recipient_lines(to, "to recipient")
+    cc_lines = _recipient_lines(cc, "cc recipient") if cc else ""
+    bcc_lines = _recipient_lines(bcc, "bcc recipient") if bcc else ""
+    content_prop = f'html content:"{escape(html_body)}"' if html_body else f'content:"{escape(body)}"'
+
+    script = f'''tell application "Microsoft Outlook"
+    set newMsg to make new outgoing message with properties {{subject:"{escape(subject)}", {content_prop}}}
+    {to_lines}{cc_lines}{bcc_lines}
+    save newMsg
+    set mid to id of newMsg
+    return (mid as text) & "{DELIM}" & subject of newMsg & "{DELIM}" & to recipients of newMsg as text
+end tell'''
+
+    try:
+        raw = await bridge.run(script)
+        parts = raw.split(DELIM) if raw else []
+        return json.dumps({
+            "status": "draft_created",
+            "entry_id": parts[0].strip() if len(parts) > 0 else "",
+            "subject": parts[1].strip() if len(parts) > 1 else subject,
+            "to": to,
+            "cc": cc,
+            "bcc": bcc,
+            "folder": "Drafts",
+        }, indent=2, default=str)
+    except Exception as e:
+        return f"Error creating draft email: {e}"
+
+
+# =====================================================================
+# TOOL 3: list_emails
 # =====================================================================
 
 @mcp.tool()
@@ -660,7 +715,54 @@ end tell'''
 
 
 # =====================================================================
-# TOOL 8: list_folders
+# TOOL 8: create_draft_reply
+# =====================================================================
+
+@mcp.tool()
+async def create_draft_reply(
+    entry_id: str,
+    body: str,
+    reply_all: bool = False,
+    html_body: str = "",
+) -> str:
+    """Create a reply draft without sending it.
+
+    Creates a reply or reply-all item, prepends the supplied body above the
+    original message thread, saves it to Drafts, and returns the draft ID.
+    """
+    reply_cmd = "reply all to" if reply_all else "reply to"
+    if html_body:
+        content_line = f'set html content of replyMsg to "{escape(html_body)}<br><br>" & html content of replyMsg'
+    else:
+        content_line = f'set content of replyMsg to "{escape(body)}" & return & return & content of replyMsg'
+
+    script = f'''tell application "Microsoft Outlook"
+    set m to message id {entry_id}
+    set originalSubject to subject of m
+    set replyMsg to {reply_cmd} m
+    {content_line}
+    save replyMsg
+    set mid to id of replyMsg
+    return (mid as text) & "{DELIM}" & originalSubject & "{DELIM}" & subject of replyMsg
+end tell'''
+
+    try:
+        raw = await bridge.run(script)
+        parts = raw.split(DELIM) if raw else []
+        return json.dumps({
+            "status": "draft_reply_created",
+            "entry_id": parts[0].strip() if len(parts) > 0 else "",
+            "original_subject": parts[1].strip() if len(parts) > 1 else "",
+            "subject": parts[2].strip() if len(parts) > 2 else "",
+            "reply_all": reply_all,
+            "folder": "Drafts",
+        }, indent=2, default=str)
+    except Exception as e:
+        return f"Error creating draft reply: {e}"
+
+
+# =====================================================================
+# TOOL 9: list_folders
 # =====================================================================
 
 @mcp.tool()

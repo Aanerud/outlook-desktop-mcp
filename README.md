@@ -114,10 +114,12 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 | Tool | Windows | macOS | Description |
 |------|:-------:|:-----:|-------------|
 | `send_email` | yes | yes | Send an email with To/CC/BCC, plain text or HTML body |
+| `create_draft_email` | yes | yes | Create an email draft with To/CC/BCC, plain text or HTML body, without sending |
 | `list_emails` | yes | yes | List recent emails from any folder, with optional unread filter |
 | `read_email` | yes | yes | Read full email content by entry ID or subject search |
 | `search_emails` | yes | yes | Full-text search across email subjects and bodies |
 | `reply_email` | yes | yes | Reply or reply-all, preserving the conversation thread |
+| `create_draft_reply` | yes | yes | Create a reply or reply-all draft, preserving the conversation thread, without sending |
 | `mark_as_read` | yes | yes | Mark a specific email as read |
 | `mark_as_unread` | yes | yes | Mark a specific email as unread |
 | `move_email` | yes | yes | Move an email to Archive, Trash, or any folder |
@@ -165,7 +167,7 @@ These tools rely on COM-specific APIs (MAPI property accessors, the Rules object
 | `toggle_rule` | yes | — | Enable or disable a mail rule by name |
 | `get_out_of_office` | yes | — | Check whether Out of Office auto-reply is on or off |
 
-**Total: 29 tools on Windows, 22 tools on macOS.**
+**Total: 31 tools on Windows, 24 tools on macOS.**
 
 ## Architecture Details
 
