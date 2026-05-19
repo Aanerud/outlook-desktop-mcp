@@ -12,6 +12,15 @@ import json
 import logging
 import re
 
+# When launched via `python -m outlook_desktop_mcp.server`, runpy loads this
+# file as sys.modules["__main__"] but NOT as sys.modules["outlook_desktop_mcp.server"].
+# Without this alias, tool modules that later do `from outlook_desktop_mcp
+# import server` re-execute this file, creating a second `bridge = OutlookBridge()`
+# distinct from the one main() actually started — every tool call then times
+# out because no COM thread services the duplicate bridge's queue.
+if __name__ == "__main__":
+    sys.modules["outlook_desktop_mcp.server"] = sys.modules["__main__"]
+
 from mcp.server.fastmcp import FastMCP
 
 from outlook_desktop_mcp.com_bridge import OutlookBridge
