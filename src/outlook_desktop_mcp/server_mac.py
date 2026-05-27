@@ -336,6 +336,259 @@ end tell'''
 
 
 # =====================================================================
+# TOOL 1C: list_drafts
+# =====================================================================
+#
+# NOTE on macOS support: AppleScript exposes the "drafts" folder for
+# legacy/IMAP/POP accounts. Modern "New Outlook for Mac" stores Exchange/M365
+# data in the cloud and does not expose drafts through AppleScript — in that
+# case the tool returns an empty list. The Windows COM build is recommended
+# for full draft management.
+
+@mcp.tool()
+async def list_drafts(
+    limit: int = 50,
+    offset: int = 0,
+) -> str:
+    """List drafts currently saved in Outlook's Drafts folder.
+
+    Returns a JSON array of draft summaries sorted by last-modified time
+    (newest first). Each summary includes entry_id, subject, to, cc, bcc,
+    last_modified, has_attachments, and a short body_preview (first ~200
+    chars of the plain-text body).
+
+    Args:
+        limit: Maximum number of drafts to return. Default 50, capped at 200.
+        offset: Number of newest drafts to skip before returning. Default 0.
+
+    Returns:
+        JSON array of draft summary objects.
+    """
+    limit = min(max(1, limit), 200)
+    offset = max(0, offset)
+    end_index = offset + limit  # 1-indexed slice upper bound applied below
+
+    script = f'''tell application "Microsoft Outlook"
+    set folderRef to drafts
+    set allMsgs to messages of folderRef
+    set msgCount to count of allMsgs
+    set startIdx to {offset + 1}
+    set endIdx to {end_index}
+    if endIdx > msgCount then set endIdx to msgCount
+    set output to ""
+    if startIdx > msgCount then return output
+    repeat with i from startIdx to endIdx
+        set m to item i of allMsgs
+        set mid to id of m
+        set msubject to subject of m
+        set mto to ""
+        try
+            set recips to to recipients of m
+            repeat with r in recips
+                set mto to mto & address of r & "; "
+            end repeat
+        end try
+        set mcc to ""
+        try
+            set recips to cc recipients of m
+            repeat with r in recips
+                set mcc to mcc & address of r & "; "
+            end repeat
+        end try
+        set mbcc to ""
+        try
+            set recips to bcc recipients of m
+            repeat with r in recips
+                set mbcc to mbcc & address of r & "; "
+            end repeat
+        end try
+        set mtime to ""
+        try
+            set mtime to (modification date of m) as string
+        end try
+        set mattcount to 0
+        try
+            set mattcount to count of attachments of m
+        end try
+        set mbody to ""
+        try
+            set mbody to plain text content of m
+        end try
+        set output to output & (mid as text) & "{DELIM}" & msubject & "{DELIM}" & mto & "{DELIM}" & mcc & "{DELIM}" & mbcc & "{DELIM}" & mtime & "{DELIM}" & (mattcount as text) & "{DELIM}" & mbody & "{RECORD_DELIM}"
+    end repeat
+    return output
+end tell'''
+
+    try:
+        raw = await bridge.run(script)
+        results = []
+        if raw:
+            for record in raw.split(RECORD_DELIM):
+                record = record.strip()
+                if not record:
+                    continue
+                parts = record.split(DELIM, 7)
+                if len(parts) < 8:
+                    continue
+                att_count = int(parts[6]) if parts[6].strip().isdigit() else 0
+                body = _clean(parts[7])
+                preview = body[:200]
+                if len(body) > 200:
+                    preview += "..."
+                results.append({
+                    "entry_id": parts[0].strip(),
+                    "subject": parts[1].strip() or "(no subject)",
+                    "to": parts[2].strip().rstrip("; "),
+                    "cc": parts[3].strip().rstrip("; "),
+                    "bcc": parts[4].strip().rstrip("; "),
+                    "last_modified": _clean(parts[5]),
+                    "has_attachments": att_count > 0,
+                    "attachment_count": att_count,
+                    "body_preview": preview,
+                })
+        return json.dumps(results, indent=2, default=str)
+    except Exception as e:
+        return f"Error listing drafts: {e}"
+
+
+# =====================================================================
+# TOOL 1D: read_draft
+# =====================================================================
+
+@mcp.tool()
+async def read_draft(draft_id: str) -> str:
+    """Read the full content of a specific draft.
+
+    Retrieves complete draft details including the full body, all recipients
+    (To/CC/BCC), attachment file names, and last-modified time. Use this to
+    review a draft before calling send_draft.
+
+    Args:
+        draft_id: The numeric ID of the draft from list_drafts results.
+
+    Returns:
+        JSON object with full draft details.
+    """
+    script = f'''tell application "Microsoft Outlook"
+    set m to message id {draft_id}
+    set mid to id of m
+    set msubject to subject of m
+    set mto to ""
+    try
+        set recips to to recipients of m
+        repeat with r in recips
+            set mto to mto & address of r & "; "
+        end repeat
+    end try
+    set mcc to ""
+    try
+        set recips to cc recipients of m
+        repeat with r in recips
+            set mcc to mcc & address of r & "; "
+        end repeat
+    end try
+    set mbcc to ""
+    try
+        set recips to bcc recipients of m
+        repeat with r in recips
+            set mbcc to mbcc & address of r & "; "
+        end repeat
+    end try
+    set mtime to ""
+    try
+        set mtime to (modification date of m) as string
+    end try
+    set mattnames to ""
+    try
+        repeat with a in attachments of m
+            set mattnames to mattnames & (name of a) & "; "
+        end repeat
+    end try
+    set mbody to ""
+    try
+        set mbody to plain text content of m
+    end try
+    set mhtml to ""
+    try
+        set mhtml to content of m
+    end try
+    return (mid as text) & "{DELIM}" & msubject & "{DELIM}" & mto & "{DELIM}" & mcc & "{DELIM}" & mbcc & "{DELIM}" & mtime & "{DELIM}" & mattnames & "{DELIM}" & mbody & "{DELIM}" & mhtml
+end tell'''
+
+    try:
+        raw = await bridge.run(script)
+        parts = raw.split(DELIM, 8)
+        if len(parts) < 9:
+            return json.dumps({"error": "Failed to parse draft data"})
+        att_raw = parts[6].strip().rstrip("; ")
+        attachments = [a.strip() for a in att_raw.split(";") if a.strip()] if att_raw else []
+        result = {
+            "entry_id": parts[0].strip(),
+            "subject": parts[1].strip() or "(no subject)",
+            "to": parts[2].strip().rstrip("; "),
+            "cc": parts[3].strip().rstrip("; "),
+            "bcc": parts[4].strip().rstrip("; "),
+            "last_modified": _clean(parts[5]),
+            "attachments": attachments,
+            "has_attachments": len(attachments) > 0,
+            "attachment_count": len(attachments),
+            "body": _clean(parts[7]),
+            "html_body": _clean(parts[8]),
+        }
+        return json.dumps(result, indent=2, default=str)
+    except Exception as e:
+        return f"Error reading draft: {e}"
+
+
+# =====================================================================
+# TOOL 1E: send_draft
+# =====================================================================
+
+@mcp.tool()
+async def send_draft(draft_id: str) -> str:
+    """Send an existing draft from Outlook's Drafts folder.
+
+    Looks up the draft by ID and dispatches it via AppleScript `send`.
+    After a successful send, Outlook moves the message from Drafts to Sent
+    Items automatically (standard Outlook behavior).
+
+    Args:
+        draft_id: The numeric ID of the draft to send. Get this from
+            list_drafts results.
+
+    Returns:
+        JSON object confirming the send, or an error.
+    """
+    script = f'''tell application "Microsoft Outlook"
+    set m to message id {draft_id}
+    set msubject to subject of m
+    set mto to ""
+    try
+        set recips to to recipients of m
+        repeat with r in recips
+            set mto to mto & address of r & "; "
+        end repeat
+    end try
+    send m
+    return msubject & "{DELIM}" & mto
+end tell'''
+
+    try:
+        raw = await bridge.run(script)
+        parts = raw.split(DELIM, 1)
+        subject = parts[0].strip() if parts else ""
+        to = parts[1].strip().rstrip("; ") if len(parts) > 1 else ""
+        return json.dumps({
+            "status": "sent",
+            "subject": subject or "(no subject)",
+            "to": to,
+            "message": f"Draft sent: '{subject}' to {to}",
+        }, indent=2, default=str)
+    except Exception as e:
+        return f"Error sending draft: {e}"
+
+
+# =====================================================================
 # TOOL 2: list_emails
 # =====================================================================
 

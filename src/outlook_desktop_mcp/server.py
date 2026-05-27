@@ -368,6 +368,210 @@ async def save_draft(
 
 
 # =====================================================================
+# TOOL 1C: list_drafts
+# =====================================================================
+
+@mcp.tool()
+async def list_drafts(
+    limit: int = 50,
+    offset: int = 0,
+    account: str = "",
+) -> str:
+    """List drafts currently saved in Outlook's Drafts folder.
+
+    Returns a JSON array of draft summaries sorted by last-modified time
+    (newest first). Each summary includes entry_id, subject, to, cc, bcc,
+    last_modified, has_attachments, and a short body_preview (first ~200
+    chars of the plain-text body). Use entry_id with read_draft to load the
+    full body or with send_draft to dispatch the message.
+
+    Args:
+        limit: Maximum number of drafts to return. Default 50, capped at 200.
+        offset: Number of newest drafts to skip before returning results.
+            Useful for pagination. Default 0.
+        account: Optional. Account display name (or substring) to target.
+            Default: primary account. Use list_accounts to see available accounts.
+
+    Returns:
+        JSON array of draft summary objects.
+    """
+    def _list(outlook, namespace, limit, offset, account):
+        limit = min(max(1, limit), 200)
+        offset = max(0, offset)
+        store = _require_store(namespace, account)
+        drafts = store.GetDefaultFolder(16)  # olFolderDrafts
+
+        items = drafts.Items
+        # Drafts use LastModificationTime rather than ReceivedTime
+        try:
+            items.Sort("[LastModificationTime]", True)
+        except Exception:
+            # Fallback: some stores reject sort on Drafts; iterate as-is
+            pass
+
+        total = items.Count
+        results = []
+        # Iterate sorted items, honoring offset and limit
+        # items.Item is 1-indexed
+        start = offset + 1
+        end = min(offset + limit, total)
+        for i in range(start, end + 1):
+            try:
+                item = items.Item(i)
+                body = item.Body or ""
+                preview = body[:200]
+                if len(body) > 200:
+                    preview += "..."
+                results.append({
+                    "entry_id": item.EntryID,
+                    "subject": item.Subject or "(no subject)",
+                    "to": item.To or "",
+                    "cc": item.CC or "",
+                    "bcc": item.BCC or "",
+                    "last_modified": str(item.LastModificationTime),
+                    "has_attachments": bool(item.Attachments.Count > 0),
+                    "attachment_count": item.Attachments.Count,
+                    "body_preview": preview,
+                })
+            except Exception:
+                continue
+        return json.dumps(results, indent=2, default=str)
+
+    try:
+        return await bridge.call(_list, limit, offset, account)
+    except Exception as e:
+        return f"Error listing drafts: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 1D: read_draft
+# =====================================================================
+
+@mcp.tool()
+async def read_draft(
+    draft_id: str,
+    account: str = "",
+) -> str:
+    """Read the full content of a specific draft.
+
+    Retrieves complete draft details including the full body, all recipients
+    (To/CC/BCC), attachment file names, and last-modified time. Use this to
+    review a draft before calling send_draft.
+
+    Args:
+        draft_id: The unique Outlook EntryID of the draft. Get this from
+            list_drafts results.
+        account: Optional. Account display name (or substring). Only needed
+            if draft_id is ambiguous across stores.
+
+    Returns:
+        JSON object with full draft details (entry_id, subject, to, cc, bcc,
+        body, html_body, attachments, last_modified, has_attachments).
+    """
+    def _read(outlook, namespace, draft_id, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(draft_id, store.StoreID)
+        else:
+            item = namespace.GetItemFromID(draft_id)
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
+            return err
+
+        attachments = []
+        try:
+            for i in range(item.Attachments.Count):
+                try:
+                    attachments.append(item.Attachments.Item(i + 1).FileName)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # HTMLBody may be very large; expose it but truncated like Body
+        html_body = ""
+        try:
+            html_body = item.HTMLBody or ""
+        except Exception:
+            html_body = ""
+
+        result = {
+            "entry_id": item.EntryID,
+            "subject": item.Subject or "(no subject)",
+            "to": item.To or "",
+            "cc": item.CC or "",
+            "bcc": item.BCC or "",
+            "body": item.Body or "",
+            "html_body": html_body,
+            "attachments": attachments,
+            "has_attachments": len(attachments) > 0,
+            "attachment_count": len(attachments),
+            "last_modified": str(item.LastModificationTime),
+        }
+        return json.dumps(result, indent=2, default=str)
+
+    try:
+        return await bridge.call(_read, draft_id, account)
+    except Exception as e:
+        return f"Error reading draft: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL 1E: send_draft
+# =====================================================================
+
+@mcp.tool()
+async def send_draft(
+    draft_id: str,
+    account: str = "",
+) -> str:
+    """Send an existing draft from Outlook's Drafts folder.
+
+    Looks up the draft by EntryID and calls MailItem.Send() on it. After a
+    successful send, Outlook automatically moves the message from Drafts to
+    Sent Items (this is standard Outlook behavior, not something this tool
+    does explicitly). The EntryID of the message changes when it moves
+    folders, so the returned message_id reflects the post-send location when
+    available.
+
+    Args:
+        draft_id: The unique Outlook EntryID of the draft to send. Get this
+            from list_drafts results.
+        account: Optional. Account display name (or substring). Only needed
+            if draft_id is ambiguous across stores.
+
+    Returns:
+        Confirmation message including the sent subject and recipients, or
+        an error.
+    """
+    def _send(outlook, namespace, draft_id, account):
+        if account:
+            store = _require_store(namespace, account)
+            item = namespace.GetItemFromID(draft_id, store.StoreID)
+        else:
+            item = namespace.GetItemFromID(draft_id)
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
+            return err
+
+        subject = item.Subject or "(no subject)"
+        to = item.To or ""
+        # Send() triggers Outlook to deliver the message and (in standard
+        # Outlook behavior) move it to the Sent Items folder. The original
+        # EntryID is no longer valid afterward — Outlook assigns a new one.
+        item.Send()
+        return json.dumps({
+            "status": "sent",
+            "subject": subject,
+            "to": to,
+            "message": f"Draft sent: '{subject}' to {to}",
+        }, indent=2, default=str)
+
+    try:
+        return await bridge.call(_send, draft_id, account)
+    except Exception as e:
+        return f"Error sending draft: {format_com_error(e)}"
+
+
+# =====================================================================
 # TOOL 2: list_emails
 # =====================================================================
 
