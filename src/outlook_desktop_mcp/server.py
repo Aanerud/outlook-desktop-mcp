@@ -305,6 +305,69 @@ async def send_email(
 
 
 # =====================================================================
+# TOOL 1B: save_draft
+# =====================================================================
+
+@mcp.tool()
+async def save_draft(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = "",
+    bcc: str = "",
+    html_body: str = "",
+    account: str = "",
+) -> str:
+    """Save an email as a draft in Outlook's Drafts folder without sending.
+
+    Creates an email and stores it in the Drafts folder of the selected account
+    so the user can review, edit, and send it later from Outlook. The message
+    is NOT sent — use send_email for that. This is the recommended tool when a
+    workflow requires human review before delivery.
+
+    Args:
+        to: One or more recipient email addresses, separated by semicolons.
+            Example: "alice@example.com" or "alice@example.com; bob@example.com"
+        subject: The email subject line.
+        body: The plain-text body of the email. If html_body is also provided,
+            both are set and Outlook will prefer the HTML version.
+        cc: Optional. CC recipients, separated by semicolons.
+        bcc: Optional. BCC recipients, separated by semicolons.
+        html_body: Optional. HTML-formatted body. When provided, Outlook renders
+            the email as HTML. The plain-text body serves as fallback.
+        account: Optional. Account display name (or substring) to save under.
+            Default: primary account. Use list_accounts to see available accounts.
+
+    Returns:
+        A confirmation message with subject and recipients, or an error.
+    """
+    def _save(outlook, namespace, to, subject, body, cc, bcc, html_body, account):
+        store = _require_store(namespace, account)
+        mail = outlook.CreateItem(OL_MAIL_ITEM)
+        # Set the sending account so the draft is filed under the correct Drafts folder
+        for acc in outlook.Session.Accounts:
+            if acc.DeliveryStore.StoreID == store.StoreID:
+                mail._oleobj_.Invoke(*(64209, 0, 8, 0, acc))  # SendUsingAccount
+                break
+        mail.To = to
+        mail.Subject = subject
+        mail.Body = body
+        if cc:
+            mail.CC = cc
+        if bcc:
+            mail.BCC = bcc
+        if html_body:
+            mail.HTMLBody = html_body
+        mail.Save()
+        return f"Draft saved: '{subject}' to {to}"
+
+    try:
+        return await bridge.call(_save, to, subject, body, cc, bcc, html_body, account)
+    except Exception as e:
+        return f"Error saving draft: {format_com_error(e)}"
+
+
+# =====================================================================
 # TOOL 2: list_emails
 # =====================================================================
 

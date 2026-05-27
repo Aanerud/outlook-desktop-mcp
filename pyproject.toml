@@ -1,6 +1,6 @@
 [project]
 name = "outlook-desktop-mcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "Outlook Desktop as an MCP server — Windows (COM) and macOS (AppleScript). No Graph API, no Entra app registration — just your local Outlook."
 readme = "README.md"
 requires-python = ">=3.12"

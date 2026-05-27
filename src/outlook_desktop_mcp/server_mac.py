@@ -274,6 +274,68 @@ end tell'''
 
 
 # =====================================================================
+# TOOL 1B: save_draft
+# =====================================================================
+
+@mcp.tool()
+async def save_draft(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = "",
+    bcc: str = "",
+    html_body: str = "",
+) -> str:
+    """Save an email as a draft in Outlook's Drafts folder without sending.
+
+    Creates an outgoing message in Outlook and leaves it in the Drafts folder
+    so the user can review, edit, and send it later from Outlook. The message
+    is NOT sent — use send_email for that. This is the recommended tool when a
+    workflow requires human review before delivery.
+
+    Args:
+        to: One or more recipient email addresses, separated by semicolons.
+            Example: "alice@example.com" or "alice@example.com; bob@example.com"
+        subject: The email subject line.
+        body: The plain-text body of the email. If html_body is also provided,
+            both are set and Outlook will prefer the HTML version.
+        cc: Optional. CC recipients, separated by semicolons.
+        bcc: Optional. BCC recipients, separated by semicolons.
+        html_body: Optional. HTML-formatted body. When provided, Outlook renders
+            the email as HTML. The plain-text body serves as fallback.
+
+    Returns:
+        A confirmation message with subject and recipients, or an error.
+    """
+    # Build recipient lines (same dialect as send_email)
+    def _recipient_lines(addresses: str, kind: str) -> str:
+        lines = ""
+        for addr in addresses.split(";"):
+            addr = addr.strip()
+            if addr:
+                lines += f'make new {kind} at newMsg with properties {{email address:{{address:"{escape(addr)}"}}}}\n'
+        return lines
+
+    to_lines = _recipient_lines(to, "to recipient")
+    cc_lines = _recipient_lines(cc, "cc recipient") if cc else ""
+    bcc_lines = _recipient_lines(bcc, "bcc recipient") if bcc else ""
+
+    content_prop = f'html content:"{escape(html_body)}"' if html_body else f'content:"{escape(body)}"'
+
+    # No `send newMsg` here — the outgoing message stays in Drafts.
+    script = f'''tell application "Microsoft Outlook"
+    set newMsg to make new outgoing message with properties {{subject:"{escape(subject)}", {content_prop}}}
+    {to_lines}{cc_lines}{bcc_lines}
+end tell'''
+
+    try:
+        await bridge.run(script)
+        return f"Draft saved: '{subject}' to {to}"
+    except Exception as e:
+        return f"Error saving draft: {e}"
+
+
+# =====================================================================
 # TOOL 2: list_emails
 # =====================================================================
 
