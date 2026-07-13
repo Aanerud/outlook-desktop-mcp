@@ -304,6 +304,59 @@ async def send_email(
         return f"Error sending email: {format_com_error(e)}"
 
 
+@mcp.tool()
+async def save_draft(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = "",
+    bcc: str = "",
+    html_body: str = "",
+    account: str = "",
+) -> str:
+    """Save an email to Drafts without sending it.
+
+    Creates a draft email in Outlook's Drafts folder. The message is not sent.
+
+    Args:
+        to: One or more recipient email addresses, separated by semicolons.
+        subject: The email subject line.
+        body: The plain-text body of the email.
+        cc: Optional. CC recipients, separated by semicolons.
+        bcc: Optional. BCC recipients, separated by semicolons.
+        html_body: Optional. HTML-formatted body.
+        account: Optional. Account display name (or substring) to save from.
+            Default: primary account. Use list_accounts to see available accounts.
+
+    Returns:
+        A confirmation message with the draft entry ID, or an error.
+    """
+    def _save(outlook, namespace, to, subject, body, cc, bcc, html_body, account):
+        store = _require_store(namespace, account)
+        mail = outlook.CreateItem(OL_MAIL_ITEM)
+        # Ensure the selected account/store is applied when saving the draft.
+        for acc in outlook.Session.Accounts:
+            if acc.DeliveryStore.StoreID == store.StoreID:
+                mail._oleobj_.Invoke(*(64209, 0, 8, 0, acc))  # SendUsingAccount
+                break
+        mail.To = to
+        mail.Subject = subject
+        mail.Body = body
+        if cc:
+            mail.CC = cc
+        if bcc:
+            mail.BCC = bcc
+        if html_body:
+            mail.HTMLBody = html_body
+        mail.Save()
+        return f"Draft saved: '{subject}' (entry_id={mail.EntryID})"
+
+    try:
+        return await bridge.call(_save, to, subject, body, cc, bcc, html_body, account)
+    except Exception as e:
+        return f"Error saving draft: {format_com_error(e)}"
+
+
 # =====================================================================
 # TOOL 2: list_emails
 # =====================================================================
