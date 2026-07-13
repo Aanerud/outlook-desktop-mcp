@@ -1049,6 +1049,40 @@ def _parse_date(date_str: str) -> datetime:
     return datetime.fromisoformat(date_str)
 
 
+def _collect_calendar_items(items, start: datetime, end: datetime, count: int):
+    """Collect calendar items in a sorted, inclusive date range."""
+    def _normalize(value: datetime) -> datetime:
+        if value.tzinfo is not None:
+            return value.replace(tzinfo=None)
+        return value
+
+    start = _normalize(start)
+    end = _normalize(end)
+
+    results = []
+    item = items.GetFirst()
+    while item is not None:
+        try:
+            item_start = _normalize(item.Start)
+        except Exception:
+            item = items.GetNext()
+            continue
+
+        if item_start < start:
+            item = items.GetNext()
+            continue
+        if item_start > end:
+            break
+
+        results.append(item)
+        if len(results) >= count:
+            break
+
+        item = items.GetNext()
+
+    return results
+
+
 # =====================================================================
 # TOOL 10: list_events
 # =====================================================================
@@ -1094,22 +1128,12 @@ async def list_events(
         start = _parse_date(start_date) if start_date else datetime.now()
         end = _parse_date(end_date) if end_date else start + timedelta(days=7)
 
-        restrict = (
-            f"[Start] >= '{start.strftime('%m/%d/%Y %H:%M')}' "
-            f"AND [Start] <= '{end.strftime('%m/%d/%Y %H:%M')}'"
-        )
-        filtered = items.Restrict(restrict)
-
         results = []
-        n = 0
-        for item in filtered:
-            n += 1
+        for item in _collect_calendar_items(items, start, end, count):
             try:
                 results.append(format_event_summary(item))
             except Exception:
                 continue
-            if n >= count:
-                break
 
         return json.dumps(results, indent=2, default=str)
 
