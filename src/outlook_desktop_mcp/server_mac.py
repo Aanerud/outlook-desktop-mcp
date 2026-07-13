@@ -273,6 +273,58 @@ end tell'''
         return f"Error sending email: {e}"
 
 
+@mcp.tool()
+async def save_draft(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = "",
+    bcc: str = "",
+    html_body: str = "",
+) -> str:
+    """Save an email to Drafts without sending it.
+
+    Creates a draft email in Outlook's Drafts folder. The message is not sent.
+
+    Args:
+        to: One or more recipient email addresses, separated by semicolons.
+        subject: The email subject line.
+        body: The plain-text body of the email.
+        cc: Optional. CC recipients, separated by semicolons.
+        bcc: Optional. BCC recipients, separated by semicolons.
+        html_body: Optional. HTML-formatted body. If provided, it is used as
+            the message content.
+
+    Returns:
+        A confirmation message, or an error.
+    """
+    def _recipient_lines(addresses: str, kind: str) -> str:
+        lines = ""
+        for addr in addresses.split(";"):
+            addr = addr.strip()
+            if addr:
+                lines += f'make new {kind} at newMsg with properties {{email address:{{address:"{escape(addr)}"}}}}\n'
+        return lines
+
+    to_lines = _recipient_lines(to, "to recipient")
+    cc_lines = _recipient_lines(cc, "cc recipient") if cc else ""
+    bcc_lines = _recipient_lines(bcc, "bcc recipient") if bcc else ""
+
+    content_prop = f'html content:"{escape(html_body)}"' if html_body else f'content:"{escape(body)}"'
+
+    script = f'''tell application "Microsoft Outlook"
+    set newMsg to make new outgoing message with properties {{subject:"{escape(subject)}", {content_prop}}}
+    {to_lines}{cc_lines}{bcc_lines}
+    save newMsg
+end tell'''
+
+    try:
+        await bridge.run(script)
+        return f"Draft saved: '{subject}'"
+    except Exception as e:
+        return f"Error saving draft: {e}"
+
+
 # =====================================================================
 # TOOL 2: list_emails
 # =====================================================================

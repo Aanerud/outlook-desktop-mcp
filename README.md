@@ -114,6 +114,7 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 | Tool | Windows | macOS | Description |
 |------|:-------:|:-----:|-------------|
 | `send_email` | yes | yes | Send an email with To/CC/BCC, plain text or HTML body |
+| `save_draft` | yes | yes | Save an email draft to Drafts without sending |
 | `list_emails` | yes | yes | List recent emails from any folder, with optional unread filter |
 | `read_email` | yes | yes | Read full email content by entry ID or subject search |
 | `search_emails` | yes | yes | Full-text search across email subjects and bodies |
@@ -165,7 +166,7 @@ These tools rely on COM-specific APIs (MAPI property accessors, the Rules object
 | `toggle_rule` | yes | — | Enable or disable a mail rule by name |
 | `get_out_of_office` | yes | — | Check whether Out of Office auto-reply is on or off |
 
-**Total: 29 tools on Windows, 22 tools on macOS.**
+**Total: 30 tools on Windows, 23 tools on macOS.**
 
 ## Architecture Details
 
