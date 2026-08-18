@@ -10,3 +10,4 @@ build/
 # Claude Code local context (not shared in repo)
 CLAUDE.md
 .claude/
+mcp-server.log

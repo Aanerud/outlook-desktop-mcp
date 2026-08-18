@@ -29,13 +29,13 @@ feature/your-change → PR → preview → PR → main → auto-publish to PyPI
 
 Requires Windows with Outlook Desktop (Classic) running.
 
+Dependencies are managed with [uv](https://docs.astral.sh/uv/):
+
 ```bash
 git clone https://github.com/YOUR-USERNAME/outlook-desktop-mcp.git
 cd outlook-desktop-mcp
-python -m venv .venv
-.venv\Scripts\activate
-pip install pywin32 "mcp[cli]" -e .
-python .venv\Scripts\pywin32_postinstall.py -install
+uv sync
+uv run python .venv\Scripts\pywin32_postinstall.py -install
 ```
 
 ## Testing
@@ -44,10 +44,10 @@ With Outlook Desktop (Classic) open:
 
 ```bash
 # COM validation (no MCP layer)
-outlook-desktop-mcp.cmd test
+uv run python tests\phase1_com_test.py
 
 # MCP protocol test
-.venv\Scripts\python tests\phase3_mcp_test.py
+uv run python tests\phase3_mcp_test.py
 ```
 
 ## Adding New Tools

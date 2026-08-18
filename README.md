@@ -10,19 +10,53 @@ Any MCP client (Claude Code, Claude Desktop, etc.) can then send emails, manage 
 
 ## Quick Start
 
-**1. Install** (requires Python 3.12+):
+Dependencies are managed with [uv](https://docs.astral.sh/uv/). uv provisions the right Python (3.12+) and installs from the committed `uv.lock`, so there is no manual venv or `pip install` step.
+
+**1. Install uv** (if you don't have it):
 
 ```bash
-pip install outlook-desktop-mcp
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-**2. Register with Claude Code:**
+**2. Clone and sync:**
 
 ```bash
-claude mcp add outlook-desktop -- outlook-desktop-mcp
+git clone https://github.com/Aanerud/outlook-desktop-mcp.git
+cd outlook-desktop-mcp
+uv sync
 ```
 
-**3. Open Outlook and start a Claude Code session.** That's it — tools are available immediately.
+**3. Register with Claude Code** (replace the path with where you cloned it):
+
+```bash
+claude mcp add outlook-desktop -- uv --directory /path/to/outlook-desktop-mcp run outlook-desktop-mcp
+```
+
+`uv --directory` pins the project location, so the server starts correctly regardless of Claude's working directory.
+
+**4. Open Outlook and start a Claude Code session.** That's it — tools are available immediately.
+
+### Claude Desktop (or any JSON-configured client)
+
+Instead of the `claude mcp add` command, add the server to your client's MCP config (for Claude Desktop, `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS). Use the same `uv --directory` invocation:
+
+```json
+{
+  "mcpServers": {
+    "outlook-desktop": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/Path/To/outlook-desktop-mcp",
+        "run",
+        "outlook-desktop-mcp"
+      ]
+    }
+  }
+}
+```
+
+Replace `/Path/To/outlook-desktop-mcp` with where you cloned the repo, then restart the client. If it can't find `uv` on its `PATH` (common for GUI-launched apps), replace `"uv"` with the absolute path from `which uv`.
 
 ## How It Works — Platform Routing
 
@@ -66,7 +100,7 @@ The server is structured as two parallel implementations with identical tool nam
 - **Python 3.12+** (x64 or ARM64)
 - **Outlook must be running** when the MCP server starts
 
-Both x64 and ARM64 Windows are supported. On ARM64, all dependencies (`pywin32`, `mcp`, `pydantic-core`, `cryptography`, `cffi`, `rpds-py`) have prebuilt `win_arm64` wheels — see the [ARM64 install notes](#arm64-windows) below for the one extra `pip` flag you need.
+Both x64 and ARM64 Windows are supported. On ARM64, all dependencies (`pywin32`, `mcp`, `pydantic-core`, `cryptography`, `cffi`, `rpds-py`) have prebuilt `win_arm64` wheels, which uv resolves from `uv.lock` — see the [ARM64 install notes](#windows-arm64) below.
 
 #### Outlook "Programmatic Access" security prompts
 
@@ -212,39 +246,33 @@ Each tool constructs a single AppleScript that fetches all needed data in one `o
 ```bash
 git clone https://github.com/Aanerud/outlook-desktop-mcp.git
 cd outlook-desktop-mcp
-python -m venv .venv
-.venv\Scripts\activate
-pip install pywin32 "mcp[cli]" -e .
-python .venv\Scripts\pywin32_postinstall.py -install
+uv sync
+uv run python .venv\Scripts\pywin32_postinstall.py -install
 ```
 
-Register from source using the launcher script:
+Register from source:
 
 ```bash
-claude mcp add outlook-desktop -- powershell.exe -Command "& 'C:\path\to\outlook-desktop-mcp\outlook-desktop-mcp.cmd' mcp"
+claude mcp add outlook-desktop -- uv --directory C:\path\to\outlook-desktop-mcp run outlook-desktop-mcp
 ```
 
 ### Windows (ARM64)
 
-The `[cli]` extra of `mcp` transitively pulls in `cryptography`, and pip's default resolver may pick a version that lacks a `win_arm64` wheel — which then fails to build because it requires a Rust toolchain plus OpenSSL. Install without the `cli` extra and force wheels-only resolution:
+The `[cli]` extra of `mcp` transitively pulls in `cryptography`, which needs a `win_arm64` wheel — building from source would require a Rust toolchain plus OpenSSL. uv resolves prebuilt `win_arm64` wheels from the committed `uv.lock`, so a plain sync works. Point uv at your ARM64 Python if it isn't the default:
 
 ```powershell
 git clone https://github.com/Aanerud/outlook-desktop-mcp.git
 cd outlook-desktop-mcp
-& "C:\Program Files\Python312-arm64\python.exe" -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install --only-binary=:all: pywin32 mcp
-python -m pip install --no-deps -e .
-python .venv\Scripts\pywin32_postinstall.py -install
+uv sync --python "C:\Program Files\Python312-arm64\python.exe"
+uv run python .venv\Scripts\pywin32_postinstall.py -install
 ```
 
-The base `mcp` package is sufficient for running the stdio server — the `[cli]` extra is only needed for the `mcp` developer CLI tools (`mcp dev`, `mcp inspector`), which aren't used at runtime.
+If uv ever cannot find a `win_arm64` wheel for a dependency, add `--no-build` to force wheels-only and surface the offender instead of attempting a source build.
 
 Register from source the same way as x64:
 
 ```bash
-claude mcp add outlook-desktop -- powershell.exe -Command "& 'C:\path\to\outlook-desktop-mcp\outlook-desktop-mcp.cmd' mcp"
+claude mcp add outlook-desktop -- uv --directory C:\path\to\outlook-desktop-mcp run outlook-desktop-mcp
 ```
 
 ### macOS
@@ -252,16 +280,16 @@ claude mcp add outlook-desktop -- powershell.exe -Command "& 'C:\path\to\outlook
 ```bash
 git clone https://github.com/Aanerud/outlook-desktop-mcp.git
 cd outlook-desktop-mcp
-python3 -m venv .venv
-source .venv/bin/activate
-pip install "mcp[cli]" -e .
+uv sync
 ```
 
 Register from source:
 
 ```bash
-claude mcp add outlook-desktop -- /path/to/outlook-desktop-mcp/.venv/bin/python -m outlook_desktop_mcp
+claude mcp add outlook-desktop -- uv --directory /path/to/outlook-desktop-mcp run outlook-desktop-mcp
 ```
+
+> If Claude can't find `uv` on its `PATH` (common for GUI-launched clients), use the absolute path from `which uv` in place of `uv` in the command above.
 
 ## Usage Examples
 
@@ -317,8 +345,8 @@ outlook-desktop-mcp/
     calendar_mcp_test.py     # Calendar MCP test
     extras_com_test.py       # Tasks/attachments/categories/rules/OOF COM test
     extras_mcp_test.py       # Tasks/attachments/categories/rules/OOF MCP test
-  outlook-desktop-mcp.cmd   # Windows launcher script
   pyproject.toml
+  uv.lock                   # Pinned, reproducible dependency lockfile
 ```
 
 ## Contributing
