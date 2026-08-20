@@ -72,8 +72,8 @@ When the server starts, it checks which operating system it is running on and ta
               ┌───────┴────────┐    ┌────────┴────────┐
               │  server.py     │    │  server_mac.py   │
               │  COM Bridge    │    │  AppleScript     │
-              │  (29 tools)    │    │  Bridge          │
-              │                │    │  (22 tools)      │
+              │  (34 tools)    │    │  Bridge          │
+              │                │    │  (27 tools)      │
               └───────┬────────┘    └────────┬─────────┘
                       |                      |
               OUTLOOK.EXE via         Microsoft Outlook
@@ -148,6 +148,10 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 | Tool | Windows | macOS | Description |
 |------|:-------:|:-----:|-------------|
 | `send_email` | yes | yes | Send an email with To/CC/BCC, plain text or HTML body |
+| `save_draft` | yes | yes | Save an email to Drafts without sending it |
+| `list_drafts` | yes | yes | List saved drafts (newest first) with pagination |
+| `read_draft` | yes | yes | Read a draft's full body, recipients, and attachments |
+| `send_draft` | yes | yes | Send an existing draft by entry ID |
 | `list_emails` | yes | yes | List recent emails from any folder, with optional unread filter |
 | `read_email` | yes | yes | Read full email content by entry ID or subject search |
 | `search_emails` | yes | yes | Full-text search across email subjects and bodies |
@@ -156,6 +160,7 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 | `mark_as_unread` | yes | yes | Mark a specific email as unread |
 | `move_email` | yes | yes | Move an email to Archive, Trash, or any folder |
 | `list_folders` | yes | yes | Browse the folder hierarchy with item counts |
+| `list_accounts` | yes | — | List Outlook accounts (stores) configured in the profile |
 
 ### Calendar
 
@@ -199,7 +204,9 @@ These tools rely on COM-specific APIs (MAPI property accessors, the Rules object
 | `toggle_rule` | yes | — | Enable or disable a mail rule by name |
 | `get_out_of_office` | yes | — | Check whether Out of Office auto-reply is on or off |
 
-**Total: 29 tools on Windows, 22 tools on macOS.**
+**Total: 34 tools on Windows, 27 tools on macOS.**
+
+> macOS draft tools use AppleScript's `drafts` folder (legacy/IMAP/POP accounts). New Outlook for Mac keeps Exchange/M365 data in the cloud and may not expose drafts via AppleScript; the Windows COM build is recommended for full draft management.
 
 ## Architecture Details
 
@@ -328,8 +335,8 @@ Windows-only examples:
 outlook-desktop-mcp/
   src/outlook_desktop_mcp/
     entrypoint.py            # Platform detection → routes to correct server
-    server.py                # Windows MCP server (29 tools, COM automation)
-    server_mac.py            # macOS MCP server (22 tools, AppleScript)
+    server.py                # Windows MCP server (34 tools, COM automation)
+    server_mac.py            # macOS MCP server (27 tools, AppleScript)
     com_bridge.py            # Async-to-COM threading bridge (Windows)
     applescript_bridge.py    # Async osascript execution (macOS)
     tools/

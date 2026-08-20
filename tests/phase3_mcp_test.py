@@ -59,7 +59,8 @@ async def run_tests():
                     log(f"    - {t.name}: {desc}")
 
                 expected = [
-                    "send_email", "save_draft", "list_emails", "read_email", "mark_as_read",
+                    "send_email", "save_draft", "list_drafts", "read_draft",
+                    "send_draft", "list_emails", "read_email", "mark_as_read",
                     "mark_as_unread", "move_email", "reply_email",
                     "list_folders", "search_emails",
                 ]
