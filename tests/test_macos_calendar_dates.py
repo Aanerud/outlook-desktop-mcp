@@ -54,12 +54,6 @@ class MacCalendarDateTests(unittest.TestCase):
     def tearDown(self):
         server_mac.bridge = self.original_bridge
 
-    def test_format_date_avoids_iso_like_applescript_dates(self):
-        formatted = format_date(datetime(2026, 5, 3, 9, 30, 0))
-
-        self.assertEqual(formatted, 'date "3 May 2026 at 09:30:00"')
-        self.assertNotIn("2026-05-03", formatted)
-
     def test_list_events_filters_sorts_and_limits_synthetic_records(self):
         raw = RECORD_DELIM.join([
             _record(
@@ -88,8 +82,10 @@ class MacCalendarDateTests(unittest.TestCase):
         events = json.loads(result)
 
         self.assertEqual([event["entry_id"] for event in events], ["earlier"])
-        self.assertIn('date "3 May 2026 at 00:00:00"', fake_bridge.script)
-        self.assertIn('date "10 May 2026 at 23:59:59"', fake_bridge.script)
+        # Assert the range bounds are interpolated via format_date, independent of
+        # its exact AppleScript encoding (see format_date_test.py for that).
+        self.assertIn(format_date(datetime(2026, 5, 3, 0, 0, 0)), fake_bridge.script)
+        self.assertIn(format_date(datetime(2026, 5, 10, 23, 59, 59)), fake_bridge.script)
 
     def test_search_events_applies_query_and_range_synthetic_records(self):
         raw = RECORD_DELIM.join([
