@@ -78,6 +78,71 @@ def _clean(value: str) -> str:
     return "" if v == "missing value" else v
 
 
+def _apple_date_from_parts(parts: list[str], start_index: int) -> datetime | None:
+    """Build a datetime from numeric AppleScript date parts."""
+    try:
+        values = [int(parts[start_index + i].strip()) for i in range(6)]
+        return datetime(*values)
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def _parse_range_start(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+def _parse_range_end(value: str) -> datetime:
+    dt = datetime.fromisoformat(value)
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value.strip()):
+        return dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return dt
+
+
+def _parse_calendar_records(
+    raw: str,
+    start: datetime,
+    end: datetime,
+    count: int,
+    query: str = "",
+) -> list[dict]:
+    query_lower = query.lower()
+    results = []
+    for record in raw.split(RECORD_DELIM):
+        record = record.strip()
+        if not record:
+            continue
+        parts = record.split(DELIM)
+        if len(parts) < 19:
+            continue
+        subject = parts[1].strip() or "(no subject)"
+        if query_lower and query_lower not in subject.lower():
+            continue
+        start_dt = _apple_date_from_parts(parts, 7)
+        end_dt = _apple_date_from_parts(parts, 13)
+        # Exclude records whose start date can't be parsed: we can't verify
+        # they fall in the requested range, so they must not leak into results.
+        if start_dt is None or not (start <= start_dt <= end):
+            continue
+        item = {
+            "entry_id": parts[0].strip(),
+            "subject": subject,
+            "start": parts[2].strip(),
+            "end": parts[3].strip(),
+            "location": _clean(parts[4]),
+            "organizer": _clean(parts[5]),
+            "all_day": parts[6].strip().lower() == "true",
+        }
+        if start_dt and end_dt:
+            item["duration"] = int((end_dt - start_dt).total_seconds() / 60)
+        item["_start_dt"] = start_dt or datetime.max
+        results.append(item)
+
+    results.sort(key=lambda item: item["_start_dt"])
+    for item in results:
+        item.pop("_start_dt", None)
+    return results[:count]
+
+
 # --- UI Scraping for New Outlook for Mac ---
 # New Outlook for Mac stores Exchange/M365 mailbox data in the cloud and
 # does NOT expose it through the AppleScript `inbox` keyword (which only
@@ -271,6 +336,311 @@ end tell'''
         return f"Email sent: '{subject}' to {to}"
     except Exception as e:
         return f"Error sending email: {e}"
+
+
+@mcp.tool()
+async def save_draft(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = "",
+    bcc: str = "",
+    html_body: str = "",
+) -> str:
+    """Save an email to Drafts without sending it.
+
+    Creates a draft email in Outlook's Drafts folder. The message is not sent.
+
+    Args:
+        to: One or more recipient email addresses, separated by semicolons.
+        subject: The email subject line.
+        body: The plain-text body of the email.
+        cc: Optional. CC recipients, separated by semicolons.
+        bcc: Optional. BCC recipients, separated by semicolons.
+        html_body: Optional. HTML-formatted body. If provided, it is used as
+            the message content.
+
+    Returns:
+        A confirmation message, or an error.
+    """
+    def _recipient_lines(addresses: str, kind: str) -> str:
+        lines = ""
+        for addr in addresses.split(";"):
+            addr = addr.strip()
+            if addr:
+                lines += f'make new {kind} at newMsg with properties {{email address:{{address:"{escape(addr)}"}}}}\n'
+        return lines
+
+    to_lines = _recipient_lines(to, "to recipient")
+    cc_lines = _recipient_lines(cc, "cc recipient") if cc else ""
+    bcc_lines = _recipient_lines(bcc, "bcc recipient") if bcc else ""
+
+    content_prop = f'html content:"{escape(html_body)}"' if html_body else f'content:"{escape(body)}"'
+
+    script = f'''tell application "Microsoft Outlook"
+    set newMsg to make new outgoing message with properties {{subject:"{escape(subject)}", {content_prop}}}
+    {to_lines}{cc_lines}{bcc_lines}
+    save newMsg
+end tell'''
+
+    try:
+        await bridge.run(script)
+        return f"Draft saved: '{subject}'"
+    except Exception as e:
+        return f"Error saving draft: {e}"
+
+
+# =====================================================================
+# TOOL 1C: list_drafts
+# =====================================================================
+#
+# NOTE on macOS support: AppleScript exposes the "drafts" folder for
+# legacy/IMAP/POP accounts. Modern "New Outlook for Mac" stores Exchange/M365
+# data in the cloud and does not expose drafts through AppleScript — in that
+# case the tool returns an empty list. The Windows COM build is recommended
+# for full draft management.
+
+@mcp.tool()
+async def list_drafts(
+    limit: int = 50,
+    offset: int = 0,
+) -> str:
+    """List drafts currently saved in Outlook's Drafts folder.
+
+    Returns a JSON array of draft summaries sorted by last-modified time
+    (newest first). Each summary includes entry_id, subject, to, cc, bcc,
+    last_modified, has_attachments, and a short body_preview (first ~200
+    chars of the plain-text body).
+
+    Args:
+        limit: Maximum number of drafts to return. Default 50, capped at 200.
+        offset: Number of newest drafts to skip before returning. Default 0.
+
+    Returns:
+        JSON array of draft summary objects.
+    """
+    limit = min(max(1, limit), 200)
+    offset = max(0, offset)
+    end_index = offset + limit  # 1-indexed slice upper bound applied below
+
+    script = f'''tell application "Microsoft Outlook"
+    set folderRef to drafts
+    set allMsgs to messages of folderRef
+    set msgCount to count of allMsgs
+    set startIdx to {offset + 1}
+    set endIdx to {end_index}
+    if endIdx > msgCount then set endIdx to msgCount
+    set output to ""
+    if startIdx > msgCount then return output
+    repeat with i from startIdx to endIdx
+        set m to item i of allMsgs
+        set mid to id of m
+        set msubject to subject of m
+        set mto to ""
+        try
+            set recips to to recipients of m
+            repeat with r in recips
+                set mto to mto & address of r & "; "
+            end repeat
+        end try
+        set mcc to ""
+        try
+            set recips to cc recipients of m
+            repeat with r in recips
+                set mcc to mcc & address of r & "; "
+            end repeat
+        end try
+        set mbcc to ""
+        try
+            set recips to bcc recipients of m
+            repeat with r in recips
+                set mbcc to mbcc & address of r & "; "
+            end repeat
+        end try
+        set mtime to ""
+        try
+            set mtime to (modification date of m) as string
+        end try
+        set mattcount to 0
+        try
+            set mattcount to count of attachments of m
+        end try
+        set mbody to ""
+        try
+            set mbody to plain text content of m
+        end try
+        set output to output & (mid as text) & "{DELIM}" & msubject & "{DELIM}" & mto & "{DELIM}" & mcc & "{DELIM}" & mbcc & "{DELIM}" & mtime & "{DELIM}" & (mattcount as text) & "{DELIM}" & mbody & "{RECORD_DELIM}"
+    end repeat
+    return output
+end tell'''
+
+    try:
+        raw = await bridge.run(script)
+        results = []
+        if raw:
+            for record in raw.split(RECORD_DELIM):
+                record = record.strip()
+                if not record:
+                    continue
+                parts = record.split(DELIM, 7)
+                if len(parts) < 8:
+                    continue
+                att_count = int(parts[6]) if parts[6].strip().isdigit() else 0
+                body = _clean(parts[7])
+                preview = body[:200]
+                if len(body) > 200:
+                    preview += "..."
+                results.append({
+                    "entry_id": parts[0].strip(),
+                    "subject": parts[1].strip() or "(no subject)",
+                    "to": parts[2].strip().rstrip("; "),
+                    "cc": parts[3].strip().rstrip("; "),
+                    "bcc": parts[4].strip().rstrip("; "),
+                    "last_modified": _clean(parts[5]),
+                    "has_attachments": att_count > 0,
+                    "attachment_count": att_count,
+                    "body_preview": preview,
+                })
+        return json.dumps(results, indent=2, default=str)
+    except Exception as e:
+        return f"Error listing drafts: {e}"
+
+
+# =====================================================================
+# TOOL 1D: read_draft
+# =====================================================================
+
+@mcp.tool()
+async def read_draft(draft_id: str) -> str:
+    """Read the full content of a specific draft.
+
+    Retrieves complete draft details including the full body, all recipients
+    (To/CC/BCC), attachment file names, and last-modified time. Use this to
+    review a draft before calling send_draft.
+
+    Args:
+        draft_id: The numeric ID of the draft from list_drafts results.
+
+    Returns:
+        JSON object with full draft details.
+    """
+    script = f'''tell application "Microsoft Outlook"
+    set m to message id {draft_id}
+    set mid to id of m
+    set msubject to subject of m
+    set mto to ""
+    try
+        set recips to to recipients of m
+        repeat with r in recips
+            set mto to mto & address of r & "; "
+        end repeat
+    end try
+    set mcc to ""
+    try
+        set recips to cc recipients of m
+        repeat with r in recips
+            set mcc to mcc & address of r & "; "
+        end repeat
+    end try
+    set mbcc to ""
+    try
+        set recips to bcc recipients of m
+        repeat with r in recips
+            set mbcc to mbcc & address of r & "; "
+        end repeat
+    end try
+    set mtime to ""
+    try
+        set mtime to (modification date of m) as string
+    end try
+    set mattnames to ""
+    try
+        repeat with a in attachments of m
+            set mattnames to mattnames & (name of a) & "; "
+        end repeat
+    end try
+    set mbody to ""
+    try
+        set mbody to plain text content of m
+    end try
+    set mhtml to ""
+    try
+        set mhtml to content of m
+    end try
+    return (mid as text) & "{DELIM}" & msubject & "{DELIM}" & mto & "{DELIM}" & mcc & "{DELIM}" & mbcc & "{DELIM}" & mtime & "{DELIM}" & mattnames & "{DELIM}" & mbody & "{DELIM}" & mhtml
+end tell'''
+
+    try:
+        raw = await bridge.run(script)
+        parts = raw.split(DELIM, 8)
+        if len(parts) < 9:
+            return json.dumps({"error": "Failed to parse draft data"})
+        att_raw = parts[6].strip().rstrip("; ")
+        attachments = [a.strip() for a in att_raw.split(";") if a.strip()] if att_raw else []
+        result = {
+            "entry_id": parts[0].strip(),
+            "subject": parts[1].strip() or "(no subject)",
+            "to": parts[2].strip().rstrip("; "),
+            "cc": parts[3].strip().rstrip("; "),
+            "bcc": parts[4].strip().rstrip("; "),
+            "last_modified": _clean(parts[5]),
+            "attachments": attachments,
+            "has_attachments": len(attachments) > 0,
+            "attachment_count": len(attachments),
+            "body": _clean(parts[7]),
+            "html_body": _clean(parts[8]),
+        }
+        return json.dumps(result, indent=2, default=str)
+    except Exception as e:
+        return f"Error reading draft: {e}"
+
+
+# =====================================================================
+# TOOL 1E: send_draft
+# =====================================================================
+
+@mcp.tool()
+async def send_draft(draft_id: str) -> str:
+    """Send an existing draft from Outlook's Drafts folder.
+
+    Looks up the draft by ID and dispatches it via AppleScript `send`.
+    After a successful send, Outlook moves the message from Drafts to Sent
+    Items automatically (standard Outlook behavior).
+
+    Args:
+        draft_id: The numeric ID of the draft to send. Get this from
+            list_drafts results.
+
+    Returns:
+        JSON object confirming the send, or an error.
+    """
+    script = f'''tell application "Microsoft Outlook"
+    set m to message id {draft_id}
+    set msubject to subject of m
+    set mto to ""
+    try
+        set recips to to recipients of m
+        repeat with r in recips
+            set mto to mto & address of r & "; "
+        end repeat
+    end try
+    send m
+    return msubject & "{DELIM}" & mto
+end tell'''
+
+    try:
+        raw = await bridge.run(script)
+        parts = raw.split(DELIM, 1)
+        subject = parts[0].strip() if parts else ""
+        to = parts[1].strip().rstrip("; ") if len(parts) > 1 else ""
+        return json.dumps({
+            "status": "sent",
+            "subject": subject or "(no subject)",
+            "to": to,
+            "message": f"Draft sent: '{subject}' to {to}",
+        }, indent=2, default=str)
+    except Exception as e:
+        return f"Error sending draft: {e}"
 
 
 # =====================================================================
@@ -832,25 +1202,24 @@ async def list_events(
     Returns:
         JSON array of event summary objects.
     """
-    start = datetime.fromisoformat(start_date) if start_date else datetime.now()
-    end = datetime.fromisoformat(end_date) if end_date else start + timedelta(days=7)
-
-    # Fetch more than needed, filter by date in Python since AppleScript
-    # whose-clause date filtering can be unreliable in Outlook for Mac.
-    fetch_limit = count * 3  # overfetch to account for out-of-range events
+    count = min(max(1, count), 200)
+    start = _parse_range_start(start_date) if start_date else datetime.now()
+    end = _parse_range_end(end_date) if end_date else start + timedelta(days=7)
 
     script = f'''tell application "Microsoft Outlook"
-    set evts to calendar events
+    set rangeStart to {format_date(start)}
+    set rangeEnd to {format_date(end)}
+    set evts to calendar events whose start time is greater than or equal to rangeStart and start time is less than or equal to rangeEnd
     set evtCount to count of evts
-    set maxFetch to {fetch_limit}
-    if evtCount < maxFetch then set maxFetch to evtCount
     set output to ""
-    repeat with i from 1 to maxFetch
+    repeat with i from 1 to evtCount
         set e to item i of evts
         set eid to id of e
         set esubject to subject of e
-        set estart to start time of e as string
-        set eend to end time of e as string
+        set estartDate to start time of e
+        set eendDate to end time of e
+        set estart to estartDate as string
+        set eend to eendDate as string
         set elocation to ""
         try
             set elocation to location of e
@@ -860,7 +1229,7 @@ async def list_events(
             set eorganizer to organizer of e
         end try
         set eallday to all day flag of e
-        set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{RECORD_DELIM}"
+        set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{DELIM}" & (year of estartDate as integer) & "{DELIM}" & (month of estartDate as integer) & "{DELIM}" & (day of estartDate as integer) & "{DELIM}" & (hours of estartDate as integer) & "{DELIM}" & (minutes of estartDate as integer) & "{DELIM}" & (seconds of estartDate as integer) & "{DELIM}" & (year of eendDate as integer) & "{DELIM}" & (month of eendDate as integer) & "{DELIM}" & (day of eendDate as integer) & "{DELIM}" & (hours of eendDate as integer) & "{DELIM}" & (minutes of eendDate as integer) & "{DELIM}" & (seconds of eendDate as integer) & "{RECORD_DELIM}"
     end repeat
     return output
 end tell'''
@@ -870,23 +1239,7 @@ end tell'''
         if not raw:
             return json.dumps([])
 
-        results = []
-        for record in raw.split(RECORD_DELIM):
-            record = record.strip()
-            if not record:
-                continue
-            parts = record.split(DELIM)
-            if len(parts) < 7:
-                continue
-            results.append({
-                "entry_id": parts[0].strip(),
-                "subject": parts[1].strip() or "(no subject)",
-                "start": parts[2].strip(),
-                "end": parts[3].strip(),
-                "location": _clean(parts[4]),
-                "organizer": _clean(parts[5]),
-                "all_day": parts[6].strip().lower() == "true",
-            })
+        results = _parse_calendar_records(raw, start, end, count)
         return json.dumps(results, indent=2, default=str)
     except Exception as e:
         return f"Error listing events: {e}"
@@ -1218,20 +1571,24 @@ async def search_events(
     Returns:
         JSON array of matching event summaries.
     """
-    safe_query = escape(query)
+    count = min(max(1, count), 200)
+    start = _parse_range_start(start_date) if start_date else datetime.now() - timedelta(days=30)
+    end = _parse_range_end(end_date) if end_date else datetime.now() + timedelta(days=30)
 
     script = f'''tell application "Microsoft Outlook"
-    set evts to calendar events whose subject contains "{safe_query}"
+    set rangeStart to {format_date(start)}
+    set rangeEnd to {format_date(end)}
+    set evts to calendar events whose start time is greater than or equal to rangeStart and start time is less than or equal to rangeEnd
     set evtCount to count of evts
-    set maxCount to {count}
-    if evtCount < maxCount then set maxCount to evtCount
     set output to ""
-    repeat with i from 1 to maxCount
+    repeat with i from 1 to evtCount
         set e to item i of evts
         set eid to id of e
         set esubject to subject of e
-        set estart to start time of e as string
-        set eend to end time of e as string
+        set estartDate to start time of e
+        set eendDate to end time of e
+        set estart to estartDate as string
+        set eend to eendDate as string
         set elocation to ""
         try
             set elocation to location of e
@@ -1241,7 +1598,7 @@ async def search_events(
             set eorganizer to organizer of e
         end try
         set eallday to all day flag of e
-        set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{RECORD_DELIM}"
+        set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{DELIM}" & (year of estartDate as integer) & "{DELIM}" & (month of estartDate as integer) & "{DELIM}" & (day of estartDate as integer) & "{DELIM}" & (hours of estartDate as integer) & "{DELIM}" & (minutes of estartDate as integer) & "{DELIM}" & (seconds of estartDate as integer) & "{DELIM}" & (year of eendDate as integer) & "{DELIM}" & (month of eendDate as integer) & "{DELIM}" & (day of eendDate as integer) & "{DELIM}" & (hours of eendDate as integer) & "{DELIM}" & (minutes of eendDate as integer) & "{DELIM}" & (seconds of eendDate as integer) & "{RECORD_DELIM}"
     end repeat
     return output
 end tell'''
@@ -1251,23 +1608,7 @@ end tell'''
         if not raw:
             return json.dumps([])
 
-        results = []
-        for record in raw.split(RECORD_DELIM):
-            record = record.strip()
-            if not record:
-                continue
-            parts = record.split(DELIM)
-            if len(parts) < 7:
-                continue
-            results.append({
-                "entry_id": parts[0].strip(),
-                "subject": parts[1].strip() or "(no subject)",
-                "start": parts[2].strip(),
-                "end": parts[3].strip(),
-                "location": _clean(parts[4]),
-                "organizer": _clean(parts[5]),
-                "all_day": parts[6].strip().lower() == "true",
-            })
+        results = _parse_calendar_records(raw, start, end, count, query)
         return json.dumps(results, indent=2, default=str)
     except Exception as e:
         return f"Error searching events: {e}"

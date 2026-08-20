@@ -9,6 +9,7 @@ import os
 import json
 import asyncio
 import logging
+from datetime import datetime
 
 # Ensure our package is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -24,12 +25,13 @@ async def run_tests():
     from mcp.client.stdio import stdio_client, StdioServerParameters
     from mcp.client.session import ClientSession
 
-    python_exe = r"C:\Development_Local\outlook-desktop-mcp\.venv\Scripts\python.exe"
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    python_exe = os.path.join(repo_root, ".venv", "Scripts", "python.exe")
 
     server_params = StdioServerParameters(
         command=python_exe,
         args=["-m", "outlook_desktop_mcp.server"],
-        cwd=r"C:\Development_Local\outlook-desktop-mcp",
+        cwd=repo_root,
     )
 
     log("=" * 60)
@@ -57,7 +59,8 @@ async def run_tests():
                     log(f"    - {t.name}: {desc}")
 
                 expected = [
-                    "send_email", "list_emails", "read_email", "mark_as_read",
+                    "send_email", "save_draft", "list_drafts", "read_draft",
+                    "send_draft", "list_emails", "read_email", "mark_as_read",
                     "mark_as_unread", "move_email", "reply_email",
                     "list_folders", "search_emails",
                 ]
@@ -67,6 +70,8 @@ async def run_tests():
                 log("  PASS")
             except Exception as e:
                 log(f"  FAIL: {e}")
+
+            draft_subject = f"Outlook Desktop MCP Draft Test {datetime.now().strftime('%Y%m%d%H%M%S')}"
 
             # ----- Test 2: list_folders -----
             total += 1
@@ -134,26 +139,42 @@ async def run_tests():
             except Exception as e:
                 log(f"  FAIL: {e}")
 
-            # ----- Test 6: send_email -----
+            # ----- Test 6: save_draft -----
             total += 1
-            log("\n--- Test 6: send_email ---")
+            log("\n--- Test 6: save_draft ---")
             try:
-                result = await session.call_tool("send_email", {
+                result = await session.call_tool("save_draft", {
                     "to": "user@example.com",
-                    "subject": "Outlook Desktop MCP - Phase 3 MCP Test",
-                    "body": "Sent through the MCP server via stdio. If you see this, the MCP layer works!",
+                    "subject": draft_subject,
+                    "body": "Saved through the MCP server via stdio. This should appear in Drafts.",
                 })
                 content = result.content[0].text
                 log(f"  Result: {content}")
-                assert "sent" in content.lower()
+                assert "draft" in content.lower()
                 passed += 1
                 log("  PASS")
             except Exception as e:
                 log(f"  FAIL: {e}")
 
-            # ----- Test 7: read_email by subject_search -----
+            # ----- Test 7: verify draft appears in Drafts -----
             total += 1
-            log("\n--- Test 7: read_email (by subject_search) ---")
+            log("\n--- Test 7: list_emails (drafts contains saved draft) ---")
+            try:
+                result = await session.call_tool("list_emails", {
+                    "folder": "drafts", "count": 20
+                })
+                drafts = json.loads(result.content[0].text)
+                found = any(d.get("subject") == draft_subject for d in drafts)
+                log(f"  Drafts returned: {len(drafts)}")
+                assert found, f"Draft subject not found in Drafts: {draft_subject}"
+                passed += 1
+                log("  PASS")
+            except Exception as e:
+                log(f"  FAIL: {e}")
+
+            # ----- Test 8: read_email by subject_search -----
+            total += 1
+            log("\n--- Test 8: read_email (by subject_search) ---")
             try:
                 result = await session.call_tool("read_email", {
                     "subject_search": "Feedback", "folder": "inbox"
