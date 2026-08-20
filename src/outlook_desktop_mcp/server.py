@@ -1087,8 +1087,30 @@ def _parse_date(date_str: str) -> datetime:
     return datetime.fromisoformat(date_str)
 
 
+def _iter_calendar_items(items):
+    """Yield items from either an Outlook COM collection or a plain iterable.
+
+    Live Outlook ``Items`` collections are walked with GetFirst/GetNext (the
+    correct idiom once sorted with IncludeRecurrences); tests and other callers
+    may pass an already-materialized list.
+    """
+    get_first = getattr(items, "GetFirst", None)
+    if callable(get_first):
+        item = get_first()
+        while item is not None:
+            yield item
+            item = items.GetNext()
+    else:
+        for item in items:
+            yield item
+
+
 def _collect_calendar_items(items, start: datetime, end: datetime, count: int):
-    """Collect calendar items in a sorted, inclusive date range."""
+    """Collect calendar items in a sorted, inclusive date range.
+
+    Assumes ``items`` is ordered by start time (COM callers pre-Sort); stops at
+    the first item past ``end``.
+    """
     def _normalize(value: datetime) -> datetime:
         if value.tzinfo is not None:
             return value.replace(tzinfo=None)
@@ -1098,16 +1120,13 @@ def _collect_calendar_items(items, start: datetime, end: datetime, count: int):
     end = _normalize(end)
 
     results = []
-    item = items.GetFirst()
-    while item is not None:
+    for item in _iter_calendar_items(items):
         try:
             item_start = _normalize(item.Start)
         except Exception:
-            item = items.GetNext()
             continue
 
         if item_start < start:
-            item = items.GetNext()
             continue
         if item_start > end:
             break
@@ -1115,8 +1134,6 @@ def _collect_calendar_items(items, start: datetime, end: datetime, count: int):
         results.append(item)
         if len(results) >= count:
             break
-
-        item = items.GetNext()
 
     return results
 
