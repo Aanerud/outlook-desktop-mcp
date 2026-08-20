@@ -774,12 +774,15 @@ async def search_emails(
         set mid to id of m
         set msubject to subject of m
         set msender to ""
-        try
-            set msender to address of sender of m
-        end try
         set msenderName to ""
         try
-            set msenderName to name of sender of m
+            set snd to sender of m
+            try
+                set msender to address of snd
+            end try
+            try
+                set msenderName to name of snd
+            end try
         end try
         set mtime to time received of m as string
         set misread to is read of m

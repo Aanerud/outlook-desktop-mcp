@@ -114,6 +114,18 @@ class MacEmailFieldParseTests(unittest.TestCase):
         self.assertEqual(result["to"], "me@example.com;")
         self.assertEqual(result["cc"], "")
 
+    def test_search_emails_populates_sender_fields(self):
+        raw = RECORD_DELIM.join([
+            _summary_record("301", "Budget report", "cfo@example.com", "Finance"),
+        ]) + RECORD_DELIM
+        server_mac.bridge = FakeBridge(raw)
+
+        result = json.loads(asyncio.run(server_mac.search_emails("Budget")))
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["sender"], "cfo@example.com")
+        self.assertEqual(result[0]["sender_name"], "Finance")
+
 
 class MacEmailFieldScriptTests(unittest.TestCase):
     """Regression guard on the generated AppleScript access patterns."""
@@ -161,6 +173,10 @@ class MacEmailFieldScriptTests(unittest.TestCase):
         script = self._capture(lambda: server_mac.read_email(subject_search="Feedback"))
         self._assert_sender_pattern(script)
         self._assert_recipient_pattern(script)
+
+    def test_search_emails_script_uses_fixed_sender_pattern(self):
+        script = self._capture(lambda: server_mac.search_emails("Budget"))
+        self._assert_sender_pattern(script)
 
 
 if __name__ == "__main__":
