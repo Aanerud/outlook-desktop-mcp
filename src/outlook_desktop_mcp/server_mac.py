@@ -119,7 +119,9 @@ def _parse_calendar_records(
             continue
         start_dt = _apple_date_from_parts(parts, 7)
         end_dt = _apple_date_from_parts(parts, 13)
-        if start_dt and not (start <= start_dt <= end):
+        # Exclude records whose start date can't be parsed: we can't verify
+        # they fall in the requested range, so they must not leak into results.
+        if start_dt is None or not (start <= start_dt <= end):
             continue
         item = {
             "entry_id": parts[0].strip(),

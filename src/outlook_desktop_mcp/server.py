@@ -1176,7 +1176,8 @@ async def list_events(
         calendar = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
         items = calendar.Items
 
-        # CRITICAL ORDER: Sort BEFORE IncludeRecurrences BEFORE Restrict
+        # CRITICAL ORDER: Sort BEFORE IncludeRecurrences so recurring
+        # occurrences expand in start-time order for range iteration.
         items.Sort("[Start]")
         items.IncludeRecurrences = True
 
