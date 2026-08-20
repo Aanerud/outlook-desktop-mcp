@@ -317,12 +317,15 @@ async def list_emails(
         set mid to id of m
         set msubject to subject of m
         set msender to ""
-        try
-            set msender to address of sender of m
-        end try
         set msenderName to ""
         try
-            set msenderName to name of sender of m
+            set snd to sender of m
+            try
+                set msender to address of snd
+            end try
+            try
+                set msenderName to name of snd
+            end try
         end try
         set mtime to time received of m as string
         set misread to is read of m
@@ -408,12 +411,15 @@ async def read_email(
     set mid to id of m
     set msubject to subject of m
     set msender to ""
-    try
-        set msender to address of sender of m
-    end try
     set msenderName to ""
     try
-        set msenderName to name of sender of m
+        set snd to sender of m
+        try
+            set msender to address of snd
+        end try
+        try
+            set msenderName to name of snd
+        end try
     end try
     set mtime to time received of m as string
     set misread to is read of m
@@ -425,14 +431,20 @@ async def read_email(
     try
         set recips to to recipients of m
         repeat with r in recips
-            set mto to mto & address of r & "; "
+            try
+                set rea to email address of r
+                set mto to mto & (address of rea) & "; "
+            end try
         end repeat
     end try
     set mcc to ""
     try
         set recips to cc recipients of m
         repeat with r in recips
-            set mcc to mcc & address of r & "; "
+            try
+                set rea to email address of r
+                set mcc to mcc & (address of rea) & "; "
+            end try
         end repeat
     end try
     set mbody to ""
@@ -452,12 +464,15 @@ end tell'''
     set mid to id of m
     set msubject to subject of m
     set msender to ""
-    try
-        set msender to address of sender of m
-    end try
     set msenderName to ""
     try
-        set msenderName to name of sender of m
+        set snd to sender of m
+        try
+            set msender to address of snd
+        end try
+        try
+            set msenderName to name of snd
+        end try
     end try
     set mtime to time received of m as string
     set misread to is read of m
@@ -469,14 +484,20 @@ end tell'''
     try
         set recips to to recipients of m
         repeat with r in recips
-            set mto to mto & address of r & "; "
+            try
+                set rea to email address of r
+                set mto to mto & (address of rea) & "; "
+            end try
         end repeat
     end try
     set mcc to ""
     try
         set recips to cc recipients of m
         repeat with r in recips
-            set mcc to mcc & address of r & "; "
+            try
+                set rea to email address of r
+                set mcc to mcc & (address of rea) & "; "
+            end try
         end repeat
     end try
     set mbody to ""
