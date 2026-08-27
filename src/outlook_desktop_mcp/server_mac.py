@@ -17,6 +17,7 @@ from mcp.server.fastmcp import FastMCP
 
 from outlook_desktop_mcp.applescript_bridge import AppleScriptBridge
 from outlook_desktop_mcp.utils.applescript_helpers import (
+    date_component_lines,
     escape,
     format_date,
     parse_date,
@@ -76,6 +77,27 @@ def _clean(value: str) -> str:
     """Replace AppleScript's 'missing value' with empty string."""
     v = value.strip()
     return "" if v == "missing value" else v
+
+
+async def _run_with_fallback(fast_script: str, legacy_script: str) -> str:
+    """Run the batched (fast) AppleScript; fall back to the per-item script.
+
+    Batched property fetches (e.g. `subject of messages 1 thru N of folder`)
+    retrieve a whole column in a single Apple Event instead of one round trip
+    per property per item, which is what made large list calls exceed the
+    script timeout. If this Outlook version rejects a batch form, retry once
+    with the legacy per-item script. Timeouts are not retried — the legacy
+    script is strictly slower.
+    """
+    try:
+        return await bridge.run(fast_script)
+    except RuntimeError as e:
+        if "timed out" in str(e):
+            raise
+        logger.warning(
+            "Batch AppleScript failed; falling back to per-item script: %s", e
+        )
+        return await bridge.run(legacy_script)
 
 
 # --- UI Scraping for New Outlook for Mac ---
@@ -305,7 +327,64 @@ async def list_emails(
     folder_ref = resolve_folder_ref(folder)
     unread_filter = ' whose is read is false' if unread_only else ''
 
-    script = f'''tell application "Microsoft Outlook"
+    # Batched property fetches: one Apple Event per property (whole column)
+    # instead of one per property per message. For unread_only the whose
+    # filter runs inside Outlook and the result is truncated locally.
+    if unread_only:
+        msg_spec = "(every message of folderRef whose is read is false)"
+    else:
+        msg_spec = "messages 1 thru maxCount of folderRef"
+
+    fast_script = f'''tell application "Microsoft Outlook"
+    set folderRef to {folder_ref}
+    set msgCount to count of (messages of folderRef{unread_filter})
+    set maxCount to {count}
+    if msgCount < maxCount then set maxCount to msgCount
+    if maxCount is 0 then return ""
+    set idList to id of {msg_spec}
+    set subjectList to subject of {msg_spec}
+    set timeList to time received of {msg_spec}
+    set readList to is read of {msg_spec}
+    set senderList to {{}}
+    try
+        set senderList to sender of {msg_spec}
+    end try
+    set attLists to {{}}
+    try
+        set attLists to attachments of {msg_spec}
+    end try
+    set output to ""
+    repeat with i from 1 to maxCount
+        set msubject to ""
+        try
+            set msubject to item i of subjectList
+        end try
+        set msender to ""
+        try
+            set msender to address of (item i of senderList)
+        end try
+        set msenderName to ""
+        try
+            set msenderName to name of (item i of senderList)
+        end try
+        set mtime to ""
+        try
+            set mtime to (item i of timeList) as string
+        end try
+        set misread to false
+        try
+            set misread to item i of readList
+        end try
+        set mattcount to 0
+        try
+            set mattcount to count of (item i of attLists)
+        end try
+        set output to output & ((item i of idList) as text) & "{DELIM}" & msubject & "{DELIM}" & msender & "{DELIM}" & msenderName & "{DELIM}" & mtime & "{DELIM}" & (misread as text) & "{DELIM}" & (mattcount as text) & "{RECORD_DELIM}"
+    end repeat
+    return output
+end tell'''
+
+    legacy_script = f'''tell application "Microsoft Outlook"
     set folderRef to {folder_ref}
     set allMsgs to messages of folderRef{unread_filter}
     set msgCount to count of allMsgs
@@ -336,7 +415,7 @@ async def list_emails(
 end tell'''
 
     try:
-        raw = await bridge.run(script)
+        raw = await _run_with_fallback(fast_script, legacy_script)
 
         results = []
         if raw:
@@ -659,6 +738,43 @@ end tell'''
         return f"Error replying to email: {e}"
 
 
+def _folder_listing_pass(level: int, max_depth: int) -> str:
+    """Generate the AppleScript block that lists folders at one nesting
+    level and recurses into subfolders up to max_depth.
+
+    Level 1 reads from the account reference (`item k of acctRefs`);
+    deeper levels read from the enclosing level's folder reference.
+    Folder names accumulate into a "Parent/Child" path. Names and unread
+    counts are fetched as batched columns; only the per-folder message
+    count needs one Apple Event per folder.
+    """
+    parent = "(item k of acctRefs)" if level == 1 else f"(item i{level - 1} of refs{level - 1})"
+    path = f"n{level}" if level == 1 else f'path{level - 1} & "/" & n{level}'
+    deeper = _folder_listing_pass(level + 1, max_depth) if level < max_depth else ""
+    return f'''
+        try
+            set refs{level} to mail folders of {parent}
+            set names{level} to name of mail folders of {parent}
+            set unread{level} to unread count of mail folders of {parent}
+            repeat with i{level} from 1 to count of refs{level}
+                set n{level} to item i{level} of names{level}
+                if n{level} is not missing value then
+                    set path{level} to {path}
+                    set c{level} to 0
+                    try
+                        set c{level} to count of messages of (item i{level} of refs{level})
+                    end try
+                    set u{level} to 0
+                    try
+                        set uu{level} to item i{level} of unread{level}
+                        if uu{level} is not missing value then set u{level} to uu{level}
+                    end try
+                    set output to output & acctName & "{DELIM}" & path{level} & "{DELIM}" & (c{level} as text) & "{DELIM}" & (u{level} as text) & "{RECORD_DELIM}"{deeper}
+                end if
+            end repeat
+        end try'''
+
+
 # =====================================================================
 # TOOL 8: list_folders
 # =====================================================================
@@ -667,18 +783,63 @@ end tell'''
 async def list_folders(max_depth: int = 2) -> str:
     """List all mail folders in the user's Outlook mailbox.
 
-    Returns a JSON array showing the folder hierarchy with item counts.
-    Use this to discover folder names for other tools (list_emails,
-    move_email, search_emails).
+    Returns a JSON array showing the folder hierarchy with item counts,
+    grouped per account (e.g. the Exchange mailbox vs the local
+    "On My Computer" store, which often contains empty folders with the
+    same names). Subfolders appear as "Parent/Child" paths. Use this to
+    discover folder names for other tools (list_emails, move_email,
+    search_emails) — pass just the folder's own name, not the full path.
 
     Args:
         max_depth: How many levels deep to recurse into subfolders.
-            Default 2. Set to 1 for top-level only.
+            Default 2 (top-level plus one level of subfolders); values
+            above 5 are capped at 5.
 
     Returns:
-        JSON array of folder objects with name, item_count, and unread_count.
+        JSON array of folder objects with account, name, item_count,
+        and unread_count.
     """
-    script = f'''tell application "Microsoft Outlook"
+    depth = max(1, min(int(max_depth), 5))
+    listing_pass = _folder_listing_pass(1, depth)
+
+    # Enumerate folders per account so identically named folders (the empty
+    # local "On My Computer" Inbox vs the real Exchange Inbox) are
+    # distinguishable, and skip the nameless account-root containers that
+    # the flat `mail folders` list exposes as "missing value".
+    fast_script = f'''tell application "Microsoft Outlook"
+    set acctRefs to {{}}
+    set acctNames to {{}}
+    try
+        repeat with a in exchange accounts
+            set end of acctRefs to a
+            set end of acctNames to name of a
+        end repeat
+    end try
+    try
+        repeat with a in imap accounts
+            set end of acctRefs to a
+            set end of acctNames to name of a
+        end repeat
+    end try
+    try
+        repeat with a in pop accounts
+            set end of acctRefs to a
+            set end of acctNames to name of a
+        end repeat
+    end try
+    try
+        set end of acctRefs to on my computer
+        set end of acctNames to "On My Computer"
+    end try
+    set output to ""
+    repeat with k from 1 to count of acctRefs
+        set acctName to item k of acctNames
+{listing_pass}
+    end repeat
+    return output
+end tell'''
+
+    legacy_script = f'''tell application "Microsoft Outlook"
     set allFolders to mail folders
     set output to ""
     repeat with f in allFolders
@@ -691,7 +852,7 @@ async def list_folders(max_depth: int = 2) -> str:
 end tell'''
 
     try:
-        raw = await bridge.run(script)
+        raw = await _run_with_fallback(fast_script, legacy_script)
         if not raw:
             return json.dumps([])
 
@@ -701,12 +862,21 @@ end tell'''
             if not record:
                 continue
             parts = record.split(DELIM)
-            if len(parts) < 3:
+            if len(parts) >= 4:
+                account, name, count_s, unread_s = (p.strip() for p in parts[:4])
+            elif len(parts) == 3:
+                # Legacy flat record from the fallback script: no account.
+                account = ""
+                name, count_s, unread_s = (p.strip() for p in parts)
+            else:
+                continue
+            if not _clean(name):
                 continue
             results.append({
-                "name": parts[0].strip(),
-                "item_count": int(parts[1].strip()) if parts[1].strip().isdigit() else 0,
-                "unread_count": int(parts[2].strip()) if parts[2].strip().isdigit() else 0,
+                "account": _clean(account),
+                "name": name,
+                "item_count": int(count_s) if count_s.isdigit() else 0,
+                "unread_count": int(unread_s) if unread_s.isdigit() else 0,
             })
         return json.dumps(results, indent=2, default=str)
     except Exception as e:
@@ -741,7 +911,58 @@ async def search_emails(
     folder_ref = resolve_folder_ref(folder)
     safe_query = escape(query)
 
-    script = f'''tell application "Microsoft Outlook"
+    msg_spec = f'(every message of folderRef whose subject contains "{safe_query}")'
+
+    fast_script = f'''tell application "Microsoft Outlook"
+    set folderRef to {folder_ref}
+    set msgCount to count of {msg_spec}
+    set maxCount to {count}
+    if msgCount < maxCount then set maxCount to msgCount
+    if maxCount is 0 then return ""
+    set idList to id of {msg_spec}
+    set subjectList to subject of {msg_spec}
+    set timeList to time received of {msg_spec}
+    set readList to is read of {msg_spec}
+    set senderList to {{}}
+    try
+        set senderList to sender of {msg_spec}
+    end try
+    set attLists to {{}}
+    try
+        set attLists to attachments of {msg_spec}
+    end try
+    set output to ""
+    repeat with i from 1 to maxCount
+        set msubject to ""
+        try
+            set msubject to item i of subjectList
+        end try
+        set msender to ""
+        try
+            set msender to address of (item i of senderList)
+        end try
+        set msenderName to ""
+        try
+            set msenderName to name of (item i of senderList)
+        end try
+        set mtime to ""
+        try
+            set mtime to (item i of timeList) as string
+        end try
+        set misread to false
+        try
+            set misread to item i of readList
+        end try
+        set mattcount to 0
+        try
+            set mattcount to count of (item i of attLists)
+        end try
+        set output to output & ((item i of idList) as text) & "{DELIM}" & msubject & "{DELIM}" & msender & "{DELIM}" & msenderName & "{DELIM}" & mtime & "{DELIM}" & (misread as text) & "{DELIM}" & (mattcount as text) & "{RECORD_DELIM}"
+    end repeat
+    return output
+end tell'''
+
+    legacy_script = f'''tell application "Microsoft Outlook"
     set folderRef to {folder_ref}
     set matchMsgs to messages of folderRef whose subject contains "{safe_query}"
     set msgCount to count of matchMsgs
@@ -772,7 +993,7 @@ async def search_emails(
 end tell'''
 
     try:
-        raw = await bridge.run(script)
+        raw = await _run_with_fallback(fast_script, legacy_script)
         if not raw:
             return json.dumps([])
 
@@ -835,42 +1056,133 @@ async def list_events(
     start = datetime.fromisoformat(start_date) if start_date else datetime.now()
     end = datetime.fromisoformat(end_date) if end_date else start + timedelta(days=7)
 
-    # Fetch more than needed, filter by date in Python since AppleScript
-    # whose-clause date filtering can be unreliable in Outlook for Mac.
-    fetch_limit = count * 3  # overfetch to account for out-of-range events
+    # The date range is applied server-side with a whose filter on start
+    # time; the cap only bounds the payload if the range matches thousands
+    # of events. Start/end come back as ISO 8601 («class isot») so Python
+    # can re-filter, sort, and truncate deterministically.
+    fetch_cap = max(count * 3, 100)
 
-    script = f'''tell application "Microsoft Outlook"
-    set evts to calendar events
-    set evtCount to count of evts
-    set maxFetch to {fetch_limit}
+    evt_spec = ("(every calendar event whose start time ≥ rangeStart "
+                "and start time ≤ rangeEnd)")
+
+    fast_script = f'''{date_component_lines("rangeStart", start)}
+{date_component_lines("rangeEnd", end)}
+tell application "Microsoft Outlook"
+    set evtCount to count of {evt_spec}
+    set maxFetch to {fetch_cap}
     if evtCount < maxFetch then set maxFetch to evtCount
+    if maxFetch is 0 then return ""
+    set idList to id of {evt_spec}
+    set subjectList to subject of {evt_spec}
+    set startList to start time of {evt_spec}
+    set endList to end time of {evt_spec}
+    set alldayList to all day flag of {evt_spec}
+    set locList to {{}}
+    try
+        set locList to location of {evt_spec}
+    end try
+    set orgList to {{}}
+    try
+        set orgList to organizer of {evt_spec}
+    end try
+end tell
+set output to ""
+repeat with i from 1 to maxFetch
+    set esubject to ""
+    try
+        set esubject to item i of subjectList
+    end try
+    set estart to ""
+    try
+        set estart to (item i of startList) as «class isot» as string
+    end try
+    set eend to ""
+    try
+        set eend to (item i of endList) as «class isot» as string
+    end try
+    set elocation to ""
+    try
+        set elocation to item i of locList
+    end try
+    set eorganizer to ""
+    try
+        set eorganizer to item i of orgList
+    end try
+    set eallday to false
+    try
+        set eallday to item i of alldayList
+    end try
+    set output to output & ((item i of idList) as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{RECORD_DELIM}"
+end repeat
+return output'''
+
+    # Fallback if this Outlook version rejects the whose-date filter:
+    # batched fetch of the first events in calendar order. The Python
+    # date filter below still applies, so out-of-range events are dropped
+    # rather than returned.
+    legacy_script = f'''tell application "Microsoft Outlook"
+    set evtCount to count of calendar events
+    set maxFetch to {fetch_cap}
+    if evtCount < maxFetch then set maxFetch to evtCount
+    if maxFetch is 0 then return ""
+    set idList to id of calendar events 1 thru maxFetch
+    set subjectList to subject of calendar events 1 thru maxFetch
+    set startList to start time of calendar events 1 thru maxFetch
+    set endList to end time of calendar events 1 thru maxFetch
+    set alldayList to all day flag of calendar events 1 thru maxFetch
+    set locList to {{}}
+    try
+        set locList to location of calendar events 1 thru maxFetch
+    end try
+    set orgList to {{}}
+    try
+        set orgList to organizer of calendar events 1 thru maxFetch
+    end try
     set output to ""
     repeat with i from 1 to maxFetch
-        set e to item i of evts
-        set eid to id of e
-        set esubject to subject of e
-        set estart to start time of e as string
-        set eend to end time of e as string
+        set esubject to ""
+        try
+            set esubject to item i of subjectList
+        end try
+        set estart to ""
+        try
+            set estart to (item i of startList) as string
+        end try
+        set eend to ""
+        try
+            set eend to (item i of endList) as string
+        end try
         set elocation to ""
         try
-            set elocation to location of e
+            set elocation to item i of locList
         end try
         set eorganizer to ""
         try
-            set eorganizer to organizer of e
+            set eorganizer to item i of orgList
         end try
-        set eallday to all day flag of e
-        set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{RECORD_DELIM}"
+        set eallday to false
+        try
+            set eallday to item i of alldayList
+        end try
+        set output to output & ((item i of idList) as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{RECORD_DELIM}"
     end repeat
     return output
 end tell'''
 
+    def _event_dt(value: str) -> datetime | None:
+        for candidate in (value, parse_date(value)):
+            try:
+                return datetime.fromisoformat(candidate)
+            except (ValueError, TypeError):
+                continue
+        return None
+
     try:
-        raw = await bridge.run(script)
+        raw = await _run_with_fallback(fast_script, legacy_script)
         if not raw:
             return json.dumps([])
 
-        results = []
+        events = []
         for record in raw.split(RECORD_DELIM):
             record = record.strip()
             if not record:
@@ -878,7 +1190,7 @@ end tell'''
             parts = record.split(DELIM)
             if len(parts) < 7:
                 continue
-            results.append({
+            events.append({
                 "entry_id": parts[0].strip(),
                 "subject": parts[1].strip() or "(no subject)",
                 "start": parts[2].strip(),
@@ -887,6 +1199,17 @@ end tell'''
                 "organizer": _clean(parts[5]),
                 "all_day": parts[6].strip().lower() == "true",
             })
+
+        # Re-filter, sort by start time, and truncate. Events whose start
+        # can't be parsed are kept (never silently dropped) and sort last.
+        filtered = []
+        for ev in events:
+            dt = _event_dt(ev["start"])
+            if dt is None or start <= dt <= end:
+                filtered.append((dt, ev))
+        filtered.sort(key=lambda pair: pair[0] or datetime.max)
+        results = [ev for _, ev in filtered[:count]]
+
         return json.dumps(results, indent=2, default=str)
     except Exception as e:
         return f"Error listing events: {e}"
@@ -1220,7 +1543,58 @@ async def search_events(
     """
     safe_query = escape(query)
 
-    script = f'''tell application "Microsoft Outlook"
+    evt_spec = f'(every calendar event whose subject contains "{safe_query}")'
+
+    fast_script = f'''tell application "Microsoft Outlook"
+    set evtCount to count of {evt_spec}
+    set maxCount to {count}
+    if evtCount < maxCount then set maxCount to evtCount
+    if maxCount is 0 then return ""
+    set idList to id of {evt_spec}
+    set subjectList to subject of {evt_spec}
+    set startList to start time of {evt_spec}
+    set endList to end time of {evt_spec}
+    set alldayList to all day flag of {evt_spec}
+    set locList to {{}}
+    try
+        set locList to location of {evt_spec}
+    end try
+    set orgList to {{}}
+    try
+        set orgList to organizer of {evt_spec}
+    end try
+    set output to ""
+    repeat with i from 1 to maxCount
+        set esubject to ""
+        try
+            set esubject to item i of subjectList
+        end try
+        set estart to ""
+        try
+            set estart to (item i of startList) as string
+        end try
+        set eend to ""
+        try
+            set eend to (item i of endList) as string
+        end try
+        set elocation to ""
+        try
+            set elocation to item i of locList
+        end try
+        set eorganizer to ""
+        try
+            set eorganizer to item i of orgList
+        end try
+        set eallday to false
+        try
+            set eallday to item i of alldayList
+        end try
+        set output to output & ((item i of idList) as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{RECORD_DELIM}"
+    end repeat
+    return output
+end tell'''
+
+    legacy_script = f'''tell application "Microsoft Outlook"
     set evts to calendar events whose subject contains "{safe_query}"
     set evtCount to count of evts
     set maxCount to {count}
@@ -1247,7 +1621,7 @@ async def search_events(
 end tell'''
 
     try:
-        raw = await bridge.run(script)
+        raw = await _run_with_fallback(fast_script, legacy_script)
         if not raw:
             return json.dumps([])
 
@@ -1297,7 +1671,48 @@ async def list_tasks(
     """
     completed_filter = "" if include_completed else " whose todo flag is not completed"
 
-    script = f'''tell application "Microsoft Outlook"
+    if include_completed:
+        task_spec = "tasks 1 thru maxCount"
+    else:
+        task_spec = "(every task whose todo flag is not completed)"
+
+    fast_script = f'''tell application "Microsoft Outlook"
+    set taskCount to count of (tasks{completed_filter})
+    set maxCount to {count}
+    if taskCount < maxCount then set maxCount to taskCount
+    if maxCount is 0 then return ""
+    set idList to id of {task_spec}
+    set nameList to name of {task_spec}
+    set flagList to todo flag of {task_spec}
+    set priList to priority of {task_spec}
+    set dueList to {{}}
+    try
+        set dueList to due date of {task_spec}
+    end try
+    set output to ""
+    repeat with i from 1 to maxCount
+        set tname to ""
+        try
+            set tname to item i of nameList
+        end try
+        set tdue to ""
+        try
+            set tdue to (item i of dueList) as string
+        end try
+        set tflag to ""
+        try
+            set tflag to (item i of flagList) as text
+        end try
+        set tpriority to ""
+        try
+            set tpriority to (item i of priList) as text
+        end try
+        set output to output & ((item i of idList) as text) & "{DELIM}" & tname & "{DELIM}" & tdue & "{DELIM}" & tflag & "{DELIM}" & tpriority & "{RECORD_DELIM}"
+    end repeat
+    return output
+end tell'''
+
+    legacy_script = f'''tell application "Microsoft Outlook"
     set taskList to tasks{completed_filter}
     set taskCount to count of taskList
     set maxCount to {count}
@@ -1319,7 +1734,7 @@ async def list_tasks(
 end tell'''
 
     try:
-        raw = await bridge.run(script)
+        raw = await _run_with_fallback(fast_script, legacy_script)
         if not raw:
             return json.dumps([])
 

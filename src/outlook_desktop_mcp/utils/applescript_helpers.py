@@ -54,6 +54,24 @@ def parse_date(text: str) -> str:
     return text
 
 
+def date_component_lines(var: str, dt: datetime) -> str:
+    """Build AppleScript that constructs a date in `var` from components.
+
+    Unlike `date "..."` literals, component assignment does not depend on
+    the system locale. Day is reset to 1 first so month assignment cannot
+    overflow (e.g. current date Aug 31 -> month 2 would roll into March).
+    """
+    secs = dt.hour * 3600 + dt.minute * 60 + dt.second
+    return (
+        f"set {var} to current date\n"
+        f"set day of {var} to 1\n"
+        f"set year of {var} to {dt.year}\n"
+        f"set month of {var} to {dt.month}\n"
+        f"set day of {var} to {dt.day}\n"
+        f"set time of {var} to {secs}"
+    )
+
+
 # Locale-independent AppleScript folder keywords
 FOLDER_MAP = {
     "inbox": "inbox",

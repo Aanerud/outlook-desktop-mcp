@@ -8,11 +8,24 @@ Every tool builds an AppleScript string and passes it to bridge.run().
 """
 import asyncio
 import logging
+import os
 
 logger = logging.getLogger("outlook_desktop_mcp.applescript_bridge")
 
-STARTUP_TIMEOUT = 10
-SCRIPT_TIMEOUT = 30
+
+def _env_timeout(name: str, default: float) -> float:
+    """Read a timeout override (seconds) from the environment."""
+    raw = os.environ.get(name)
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            logger.warning("Invalid %s=%r; using default %ss", name, raw, default)
+    return default
+
+
+STARTUP_TIMEOUT = _env_timeout("OUTLOOK_MCP_STARTUP_TIMEOUT", 10)
+SCRIPT_TIMEOUT = _env_timeout("OUTLOOK_MCP_SCRIPT_TIMEOUT", 120)
 
 
 class AppleScriptBridge:
