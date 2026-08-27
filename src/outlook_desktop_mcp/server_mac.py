@@ -104,6 +104,7 @@ def _parse_calendar_records(
     end: datetime,
     count: int,
     query: str = "",
+    retain_key: bool = False,
 ) -> list[dict]:
     query_lower = query.lower()
     results = []
@@ -136,6 +137,321 @@ def _parse_calendar_records(
             item["duration"] = int((end_dt - start_dt).total_seconds() / 60)
         item["_start_dt"] = start_dt or datetime.max
         results.append(item)
+
+    results.sort(key=lambda item: item["_start_dt"])
+    if retain_key:
+        # Caller will merge with other sources, then sort/limit itself.
+        return results
+    for item in results:
+        item.pop("_start_dt", None)
+    return results[:count]
+
+
+# ---------------------------------------------------------------------
+# Recurring-event expansion
+# ---------------------------------------------------------------------
+# Outlook for Mac exposes a recurring meeting only as a single *master*
+# ``calendar event`` whose ``start time`` is the series' FIRST occurrence.
+# A ``whose start time >= rangeStart`` filter therefore silently drops every
+# recurring series whose first occurrence predates the range — i.e. virtually
+# all standing meetings. To fix this we fetch the recurring masters separately,
+# read their recurrence rule, and expand the individual occurrences that fall
+# inside the requested window ourselves (stdlib only, no extra dependency).
+#
+# Known limitation: per-occurrence exceptions (a single instance deleted or
+# moved to a different time) are not read back from Outlook, so an exception is
+# shown at its original slot. Surfacing the meeting is still far better than
+# omitting the whole series, which is the bug this replaces.
+
+_WEEKDAY_FLAGS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _fmt_apple_datetime(dt: datetime) -> str:
+    """Render a datetime the way AppleScript's ``date as string`` does,
+    e.g. ``Thursday, August 27, 2026 at 11:00:00 AM`` (no leading zeros on
+    day or hour), so expanded occurrences match native records."""
+    hour12 = dt.hour % 12 or 12
+    ampm = "AM" if dt.hour < 12 else "PM"
+    return (
+        f"{dt.strftime('%A')}, {dt.strftime('%B')} {dt.day}, {dt.year} "
+        f"at {hour12}:{dt.minute:02d}:{dt.second:02d} {ampm}"
+    )
+
+
+def _week_start(d):
+    """Monday-based start of the week containing date ``d``."""
+    return d - timedelta(days=d.weekday())
+
+
+def _canonical_freq(rtype: str):
+    """Normalise Outlook's recurrence-type strings ("weekly", "absolute
+    yearly", "relative monthly", "every weekday", ...) to a canonical
+    frequency token. Anything monthly/yearly is routed to its own handler —
+    never the weekly fallback — so weekday-based monthly reminders can't leak
+    out as spurious weekly hits. Returns (freq, force_weekdays_or_None)."""
+    rt = (rtype or "").lower()
+    if "weekday" in rt:                 # "every weekday"
+        return "weekly", [True] * 5 + [False, False]
+    if "dai" in rt:
+        return "daily", None
+    if "week" in rt:
+        return "weekly", None
+    if "month" in rt:                   # absolute/relative monthly
+        return "monthly", None
+    if "year" in rt:                    # absolute/relative yearly
+        return "yearly", None
+    return "weekly", None               # conservative last resort
+
+
+def _recurrence_matches(d, d0, freq: str, interval: int, wd: list) -> bool:
+    """True if date ``d`` is an occurrence of a series that started on ``d0``.
+
+    ``freq`` is already canonicalised. monthly/yearly use day-of-month and
+    month/day equality respectively: this is exact for "absolute" patterns and
+    conservatively under-reports "relative" ones (e.g. "third Thursday"),
+    which is safe — a missed monthly reminder beats a wrong one."""
+    if d < d0:
+        return False
+    if freq == "daily":
+        return (d - d0).days % interval == 0
+    if freq == "weekly":
+        if any(wd):
+            if not wd[d.weekday()]:
+                return False
+        elif d.weekday() != d0.weekday():
+            return False
+        weeks = (_week_start(d) - _week_start(d0)).days // 7
+        return weeks % interval == 0
+    if freq == "monthly":
+        if d.day != d0.day:
+            return False
+        months = (d.year - d0.year) * 12 + (d.month - d0.month)
+        return months >= 0 and months % interval == 0
+    if freq == "yearly":
+        if (d.month, d.day) != (d0.month, d0.day):
+            return False
+        return (d.year - d0.year) % interval == 0
+    return False
+
+
+def _occurrence_dates(d0, rtype, interval, wd, until, occ_count, lo, hi):
+    """Yield occurrence dates within [lo, hi] (inclusive of both date bounds)."""
+    interval = max(1, interval)
+    freq, forced_wd = _canonical_freq(rtype)
+    if forced_wd is not None:
+        wd = forced_wd
+    rtype = freq
+    hard_hi = min(hi, until) if until else hi
+    guard = 0
+    if occ_count:
+        # Count-limited series: walk from the anchor, honouring the cap.
+        emitted, d = 0, d0
+        while d <= hard_hi and emitted < occ_count and guard < 20000:
+            guard += 1
+            if _recurrence_matches(d, d0, rtype, interval, wd):
+                emitted += 1
+                if d >= lo:
+                    yield d
+            d += timedelta(days=1)
+        return
+    d = max(d0, lo)
+    while d <= hard_hi and guard < 20000:
+        guard += 1
+        if _recurrence_matches(d, d0, rtype, interval, wd):
+            yield d
+        d += timedelta(days=1)
+
+
+def _recurring_events_script() -> str:
+    """AppleScript that emits one DELIM record per recurring master with the
+    fields needed to expand it: identity, master start/end parts, recurrence
+    type, interval, weekday flags, and series end (date and/or count)."""
+    return f'''tell application "Microsoft Outlook"
+    set evts to calendar events whose is recurring is true
+    set output to ""
+    repeat with e in evts
+        try
+            set eid to id of e
+            set esubject to subject of e
+            set estartDate to start time of e
+            set eendDate to end time of e
+            set elocation to ""
+            try
+                set elocation to location of e
+            end try
+            set eorganizer to ""
+            try
+                set eorganizer to organizer of e
+            end try
+            set eallday to all day flag of e
+            set r to recurrence of e
+            set rtype to (recurrence type of r) as string
+            set rint to 1
+            try
+                set rint to («class ReOi» of r) as integer
+            end try
+            set dMon to false
+            set dTue to false
+            set dWed to false
+            set dThu to false
+            set dFri to false
+            set dSat to false
+            set dSun to false
+            try
+                set dw to days of week of r
+                set dMon to Monday of dw
+                set dTue to Tuesday of dw
+                set dWed to Wednesday of dw
+                set dThu to Thursday of dw
+                set dFri to Friday of dw
+                set dSat to Saturday of dw
+                set dSun to Sunday of dw
+            end try
+            set etype to ""
+            set eY to ""
+            set eMo to ""
+            set eD to ""
+            set eCount to ""
+            try
+                set endRec to «class ReED» of r
+                set etype to («class pEnT» of endRec) as string
+                try
+                    set endD to «class peDa» of endRec
+                    set eY to (year of endD as integer)
+                    set eMo to (month of endD as integer)
+                    set eD to (day of endD as integer)
+                end try
+                try
+                    set eCount to («class peNo» of endRec) as integer
+                end try
+            end try
+            set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & (estartDate as string) & "{DELIM}" & (eendDate as string) & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{DELIM}" & (year of estartDate as integer) & "{DELIM}" & (month of estartDate as integer) & "{DELIM}" & (day of estartDate as integer) & "{DELIM}" & (hours of estartDate as integer) & "{DELIM}" & (minutes of estartDate as integer) & "{DELIM}" & (seconds of estartDate as integer) & "{DELIM}" & (year of eendDate as integer) & "{DELIM}" & (month of eendDate as integer) & "{DELIM}" & (day of eendDate as integer) & "{DELIM}" & (hours of eendDate as integer) & "{DELIM}" & (minutes of eendDate as integer) & "{DELIM}" & (seconds of eendDate as integer) & "{DELIM}" & rtype & "{DELIM}" & (rint as text) & "{DELIM}" & ((dMon as text) & "," & (dTue as text) & "," & (dWed as text) & "," & (dThu as text) & "," & (dFri as text) & "," & (dSat as text) & "," & (dSun as text)) & "{DELIM}" & etype & "{DELIM}" & (eY as text) & "{DELIM}" & (eMo as text) & "{DELIM}" & (eD as text) & "{DELIM}" & (eCount as text) & "{RECORD_DELIM}"
+        end try
+    end repeat
+    return output
+end tell'''
+
+
+def _expand_recurring_records(
+    raw: str,
+    start: datetime,
+    end: datetime,
+    query: str = "",
+) -> list[dict]:
+    """Turn recurring-master records into per-occurrence event dicts that fall
+    within [start, end]. Each dict carries a ``_start_dt`` key for merge-sort."""
+    from datetime import date as _date
+    query_lower = query.lower()
+    items: list[dict] = []
+    for record in raw.split(RECORD_DELIM):
+        record = record.strip()
+        if not record:
+            continue
+        parts = record.split(DELIM)
+        if len(parts) < 27:
+            continue
+        subject = parts[1].strip() or "(no subject)"
+        if query_lower and query_lower not in subject.lower():
+            continue
+        master_start = _apple_date_from_parts(parts, 7)
+        master_end = _apple_date_from_parts(parts, 13)
+        if master_start is None:
+            continue
+        duration = (master_end - master_start) if master_end else timedelta(0)
+        rtype = parts[19].strip()
+        try:
+            interval = int(parts[20].strip())
+        except (ValueError, IndexError):
+            interval = 1
+        flags = [p.strip().lower() == "true" for p in parts[21].split(",")]
+        if len(flags) != 7:
+            flags = [False] * 7
+        until = None
+        try:
+            uy = [int(parts[23 + i].strip()) for i in range(3)]
+            until = _date(uy[0], uy[1], uy[2])
+        except (ValueError, IndexError):
+            until = None
+        try:
+            occ_count = int(parts[26].strip())
+        except (ValueError, IndexError):
+            occ_count = None
+        # Cheap skip: series that ended before the window or starts after it.
+        if until and until < start.date():
+            continue
+        if master_start.date() > end.date():
+            continue
+        for occ_date in _occurrence_dates(
+            master_start.date(), rtype, interval, flags,
+            until, occ_count, start.date(), end.date(),
+        ):
+            occ_start = datetime(
+                occ_date.year, occ_date.month, occ_date.day,
+                master_start.hour, master_start.minute, master_start.second,
+            )
+            occ_end = occ_start + duration
+            if not (start <= occ_start <= end):
+                continue
+            item = {
+                "entry_id": parts[0].strip(),
+                "subject": subject,
+                "start": _fmt_apple_datetime(occ_start),
+                "end": _fmt_apple_datetime(occ_end),
+                "location": _clean(parts[4]),
+                "organizer": _clean(parts[5]),
+                "all_day": parts[6].strip().lower() == "true",
+                "duration": int(duration.total_seconds() / 60),
+                "_start_dt": occ_start,
+            }
+            items.append(item)
+    return items
+
+
+async def _gather_events(
+    start: datetime,
+    end: datetime,
+    count: int,
+    query: str = "",
+) -> list[dict]:
+    """Collect both non-recurring events (native start-time filter) and
+    expanded recurring occurrences, merged and sorted by start time."""
+    non_recurring_script = f'''tell application "Microsoft Outlook"
+    set rangeStart to {format_date(start)}
+    set rangeEnd to {format_date(end)}
+    set evts to calendar events whose start time is greater than or equal to rangeStart and start time is less than or equal to rangeEnd and is recurring is false
+    set evtCount to count of evts
+    set output to ""
+    repeat with i from 1 to evtCount
+        set e to item i of evts
+        set eid to id of e
+        set esubject to subject of e
+        set estartDate to start time of e
+        set eendDate to end time of e
+        set estart to estartDate as string
+        set eend to eendDate as string
+        set elocation to ""
+        try
+            set elocation to location of e
+        end try
+        set eorganizer to ""
+        try
+            set eorganizer to organizer of e
+        end try
+        set eallday to all day flag of e
+        set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{DELIM}" & (year of estartDate as integer) & "{DELIM}" & (month of estartDate as integer) & "{DELIM}" & (day of estartDate as integer) & "{DELIM}" & (hours of estartDate as integer) & "{DELIM}" & (minutes of estartDate as integer) & "{DELIM}" & (seconds of estartDate as integer) & "{DELIM}" & (year of eendDate as integer) & "{DELIM}" & (month of eendDate as integer) & "{DELIM}" & (day of eendDate as integer) & "{DELIM}" & (hours of eendDate as integer) & "{DELIM}" & (minutes of eendDate as integer) & "{DELIM}" & (seconds of eendDate as integer) & "{RECORD_DELIM}"
+    end repeat
+    return output
+end tell'''
+
+    raw = await bridge.run(non_recurring_script)
+    results = _parse_calendar_records(raw or "", start, end, count, query, retain_key=True)
+
+    try:
+        rec_raw = await bridge.run(_recurring_events_script())
+        if rec_raw:
+            results.extend(_expand_recurring_records(rec_raw, start, end, query))
+    except Exception as exc:  # never let recurrence expansion break the base result
+        logger.warning("Recurring-event expansion failed: %s", exc)
 
     results.sort(key=lambda item: item["_start_dt"])
     for item in results:
@@ -1230,40 +1546,8 @@ async def list_events(
     start = _parse_range_start(start_date) if start_date else datetime.now()
     end = _parse_range_end(end_date) if end_date else start + timedelta(days=7)
 
-    script = f'''tell application "Microsoft Outlook"
-    set rangeStart to {format_date(start)}
-    set rangeEnd to {format_date(end)}
-    set evts to calendar events whose start time is greater than or equal to rangeStart and start time is less than or equal to rangeEnd
-    set evtCount to count of evts
-    set output to ""
-    repeat with i from 1 to evtCount
-        set e to item i of evts
-        set eid to id of e
-        set esubject to subject of e
-        set estartDate to start time of e
-        set eendDate to end time of e
-        set estart to estartDate as string
-        set eend to eendDate as string
-        set elocation to ""
-        try
-            set elocation to location of e
-        end try
-        set eorganizer to ""
-        try
-            set eorganizer to organizer of e
-        end try
-        set eallday to all day flag of e
-        set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{DELIM}" & (year of estartDate as integer) & "{DELIM}" & (month of estartDate as integer) & "{DELIM}" & (day of estartDate as integer) & "{DELIM}" & (hours of estartDate as integer) & "{DELIM}" & (minutes of estartDate as integer) & "{DELIM}" & (seconds of estartDate as integer) & "{DELIM}" & (year of eendDate as integer) & "{DELIM}" & (month of eendDate as integer) & "{DELIM}" & (day of eendDate as integer) & "{DELIM}" & (hours of eendDate as integer) & "{DELIM}" & (minutes of eendDate as integer) & "{DELIM}" & (seconds of eendDate as integer) & "{RECORD_DELIM}"
-    end repeat
-    return output
-end tell'''
-
     try:
-        raw = await bridge.run(script)
-        if not raw:
-            return json.dumps([])
-
-        results = _parse_calendar_records(raw, start, end, count)
+        results = await _gather_events(start, end, count)
         return json.dumps(results, indent=2, default=str)
     except Exception as e:
         return f"Error listing events: {e}"
@@ -1599,40 +1883,8 @@ async def search_events(
     start = _parse_range_start(start_date) if start_date else datetime.now() - timedelta(days=30)
     end = _parse_range_end(end_date) if end_date else datetime.now() + timedelta(days=30)
 
-    script = f'''tell application "Microsoft Outlook"
-    set rangeStart to {format_date(start)}
-    set rangeEnd to {format_date(end)}
-    set evts to calendar events whose start time is greater than or equal to rangeStart and start time is less than or equal to rangeEnd
-    set evtCount to count of evts
-    set output to ""
-    repeat with i from 1 to evtCount
-        set e to item i of evts
-        set eid to id of e
-        set esubject to subject of e
-        set estartDate to start time of e
-        set eendDate to end time of e
-        set estart to estartDate as string
-        set eend to eendDate as string
-        set elocation to ""
-        try
-            set elocation to location of e
-        end try
-        set eorganizer to ""
-        try
-            set eorganizer to organizer of e
-        end try
-        set eallday to all day flag of e
-        set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{DELIM}" & (year of estartDate as integer) & "{DELIM}" & (month of estartDate as integer) & "{DELIM}" & (day of estartDate as integer) & "{DELIM}" & (hours of estartDate as integer) & "{DELIM}" & (minutes of estartDate as integer) & "{DELIM}" & (seconds of estartDate as integer) & "{DELIM}" & (year of eendDate as integer) & "{DELIM}" & (month of eendDate as integer) & "{DELIM}" & (day of eendDate as integer) & "{DELIM}" & (hours of eendDate as integer) & "{DELIM}" & (minutes of eendDate as integer) & "{DELIM}" & (seconds of eendDate as integer) & "{RECORD_DELIM}"
-    end repeat
-    return output
-end tell'''
-
     try:
-        raw = await bridge.run(script)
-        if not raw:
-            return json.dumps([])
-
-        results = _parse_calendar_records(raw, start, end, count, query)
+        results = await _gather_events(start, end, count, query)
         return json.dumps(results, indent=2, default=str)
     except Exception as e:
         return f"Error searching events: {e}"
