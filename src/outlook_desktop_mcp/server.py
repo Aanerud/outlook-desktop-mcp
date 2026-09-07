@@ -15,7 +15,7 @@ import re
 from mcp.server.fastmcp import FastMCP
 
 from outlook_desktop_mcp.com_bridge import OutlookBridge
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import os
 
@@ -359,13 +359,13 @@ async def list_emails(
             restrictions.append("[UnRead] = True")
         if start_date:
             start = _parse_date(start_date)
-            restrictions.append(f"[ReceivedTime] >= '{start.strftime('%m/%d/%Y %H:%M')}'")
+            restrictions.append(f"[ReceivedTime] >= '{_outlook_date_literal(start)}'")
         if end_date:
             end = _parse_date(end_date)
-            restrictions.append(f"[ReceivedTime] <= '{end.strftime('%m/%d/%Y %H:%M')}'")
+            restrictions.append(f"[ReceivedTime] <= '{_outlook_date_literal(end)}'")
         elif start_date:
             # Default end to now when start is specified
-            restrictions.append(f"[ReceivedTime] <= '{datetime.now().strftime('%m/%d/%Y %H:%M')}'")
+            restrictions.append(f"[ReceivedTime] <= '{_outlook_date_literal(datetime.now())}'")
 
         if restrictions:
             items = items.Restrict(" AND ".join(restrictions))
@@ -749,16 +749,16 @@ async def search_emails(
         if start_date:
             start = _parse_date(start_date)
             dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" >= '{start.strftime('%m/%d/%Y %H:%M')}'"
+                f"\"urn:schemas:httpmail:datereceived\" >= '{_outlook_dasl_date_literal(start)}'"
             )
         if end_date:
             end = _parse_date(end_date)
             dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" <= '{end.strftime('%m/%d/%Y %H:%M')}'"
+                f"\"urn:schemas:httpmail:datereceived\" <= '{_outlook_dasl_date_literal(end)}'"
             )
         elif start_date:
             dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" <= '{datetime.now().strftime('%m/%d/%Y %H:%M')}'"
+                f"\"urn:schemas:httpmail:datereceived\" <= '{_outlook_dasl_date_literal(datetime.now())}'"
             )
 
         filter_str = "@SQL=" + " AND ".join(dasl_parts)
@@ -790,6 +790,81 @@ async def search_emails(
 def _parse_date(date_str: str) -> datetime:
     """Parse ISO 8601 date string like '2026-02-25 14:00' or '2026-02-25T14:00:00'."""
     return datetime.fromisoformat(date_str)
+
+
+# --- Helper: locale-safe date literals for Outlook Restrict()/DASL filters ---
+
+# Win32 constants for GetDateFormatW / GetTimeFormatW. win32con does not
+# reliably export these, so define them here.
+_LOCALE_USER_DEFAULT = 0x0400
+_DATE_SHORTDATE = 0x00000001
+_TIME_NOSECONDS = 0x00000002
+
+
+def _format_locale_datetime(dt: datetime) -> str:
+    """Format ``dt`` (a naive wall-clock time) in the Windows user locale's
+    short-date + time format, without seconds.
+
+    Calls GetDateFormatW / GetTimeFormatW directly via ctypes with a
+    ``SYSTEMTIME`` filled from ``dt``'s fields, so no time-zone conversion is
+    applied. (A ``datetime`` handed to pywin32's ``win32api.GetDateFormat`` is
+    silently shifted between local time and UTC, which is why the Win32 API is
+    called here instead.) Windows-only.
+    """
+    import ctypes
+
+    class _SYSTEMTIME(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint16) for name in (
+            "wYear", "wMonth", "wDayOfWeek", "wDay",
+            "wHour", "wMinute", "wSecond", "wMilliseconds",
+        )]
+
+    st = _SYSTEMTIME()
+    st.wYear, st.wMonth, st.wDay = dt.year, dt.month, dt.day
+    st.wHour, st.wMinute = dt.hour, dt.minute
+
+    kernel32 = ctypes.windll.kernel32
+    buf = ctypes.create_unicode_buffer(160)
+
+    def _fmt(func, flags):
+        if not func(_LOCALE_USER_DEFAULT, flags, ctypes.byref(st), None,
+                    buf, len(buf)):
+            raise ctypes.WinError()
+        return buf.value
+
+    date_str = _fmt(kernel32.GetDateFormatW, _DATE_SHORTDATE)
+    time_str = _fmt(kernel32.GetTimeFormatW, _TIME_NOSECONDS)
+    return f"{date_str} {time_str}"
+
+
+def _outlook_date_literal(dt: datetime) -> str:
+    """Date literal for a Jet Restrict() filter (``[ReceivedTime]``, ``[Start]``).
+
+    Outlook parses the literal using the Windows regional short-date and time
+    settings (see MS docs, "Filtering Items Using a Date-time Comparison"). A
+    hard-coded ``strftime('%m/%d/%Y')`` literal such as ``'09/07/2026'`` is
+    therefore read as 9 Jul, not 7 Sep, on a day-first (DD/MM/YYYY) locale --
+    day and month are silently swapped and the filter returns wrong or empty
+    results without raising an error. Formatting the literal with the same
+    regional settings the parser uses makes it round-trip on every locale;
+    this mirrors the VBA ``Format(dt, "General Date")`` the docs recommend.
+
+    Jet filters evaluate the literal as local time, so ``dt`` (local) is
+    formatted as-is.
+    """
+    return _format_locale_datetime(dt)
+
+
+def _outlook_dasl_date_literal(dt: datetime) -> str:
+    """Date literal for a DASL Restrict() filter (a property referenced by
+    namespace, e.g. ``urn:schemas:httpmail:datereceived``).
+
+    Same locale formatting as :func:`_outlook_date_literal`, but DASL filters
+    evaluate the literal as UTC (unlike Jet filters, which use local time), so
+    ``dt`` is converted to UTC first. A naive ``dt`` is treated as local time.
+    """
+    utc = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return _format_locale_datetime(utc)
 
 
 # =====================================================================
@@ -838,8 +913,8 @@ async def list_events(
         end = _parse_date(end_date) if end_date else start + timedelta(days=7)
 
         restrict = (
-            f"[Start] >= '{start.strftime('%m/%d/%Y %H:%M')}' "
-            f"AND [Start] <= '{end.strftime('%m/%d/%Y %H:%M')}'"
+            f"[Start] >= '{_outlook_date_literal(start)}' "
+            f"AND [Start] <= '{_outlook_date_literal(end)}'"
         )
         filtered = items.Restrict(restrict)
 
@@ -1275,8 +1350,8 @@ async def search_events(
         end = _parse_date(end_date) if end_date else datetime.now() + timedelta(days=30)
 
         restrict = (
-            f"[Start] >= '{start.strftime('%m/%d/%Y %H:%M')}' "
-            f"AND [Start] <= '{end.strftime('%m/%d/%Y %H:%M')}'"
+            f"[Start] >= '{_outlook_date_literal(start)}' "
+            f"AND [Start] <= '{_outlook_date_literal(end)}'"
         )
         filtered = items.Restrict(restrict)
 
