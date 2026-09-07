@@ -22,6 +22,29 @@ def strip_html(html: str) -> str:
     return text
 
 
+def _recipient_field(item, attr: str, recipient_type: int) -> str:
+    """Return a recipient list, tolerating item classes that lack To/CC.
+
+    MailItem exposes To/CC directly, but MeetingItem (IPM.Schedule.Meeting.*)
+    does not. Reading those properties raises AttributeError and previously made
+    read_email fail outright for every meeting invitation. The Recipients
+    collection is present on both, so fall back to it.
+    """
+    value = getattr(item, attr, None)
+    if value:
+        return value
+    try:
+        recipients = item.Recipients
+        names = [
+            recipients.Item(i).Name
+            for i in range(1, recipients.Count + 1)
+            if recipients.Item(i).Type == recipient_type
+        ]
+    except Exception:
+        return ""
+    return "; ".join(name for name in names if name)
+
+
 def format_email_summary(item) -> dict:
     """Extract key fields from an Outlook MailItem into a dict."""
     return {
@@ -33,15 +56,16 @@ def format_email_summary(item) -> dict:
         "unread": bool(item.UnRead),
         "has_attachments": bool(item.Attachments.Count > 0),
         "attachment_count": item.Attachments.Count,
+        "message_class": getattr(item, "MessageClass", "") or "",
     }
 
 
 def format_email_full(item, body_max_length: int = 5000) -> dict:
     """Extract full email details including body."""
     result = format_email_summary(item)
-    result["to"] = item.To or ""
-    result["cc"] = item.CC or ""
-    result["body"] = truncate(item.Body or "", body_max_length)
+    result["to"] = _recipient_field(item, "To", 1)
+    result["cc"] = _recipient_field(item, "CC", 2)
+    result["body"] = truncate(getattr(item, "Body", "") or "", body_max_length)
     return result
 
 
