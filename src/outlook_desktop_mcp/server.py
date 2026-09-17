@@ -910,6 +910,7 @@ async def create_event(
     all_day: bool = False,
     reminder_minutes: int = 15,
     account: str = "",
+    calendar: str = "",
 ) -> str:
     """Create a personal calendar appointment (no attendees).
 
@@ -932,19 +933,35 @@ async def create_event(
             Default 15. Set to 0 to disable reminder.
         account: Optional. Account display name (or substring) to create
             the event in. Default: primary account.
+        calendar: Optional. Name or slash-delimited path of a specific
+            calendar folder to create the event in, e.g. "Your family" or
+            "Kalender/Your family". Use list_calendars to discover available
+            calendar folders (including shared/synced ones). Default: the
+            account's default Calendar folder.
 
     Returns:
         Confirmation with event subject and entry_id, or an error.
     """
     def _create(outlook, namespace, subject, start, end, location, body,
-                all_day, reminder_minutes, account):
-        appt = outlook.CreateItem(OL_APPOINTMENT_ITEM)
-        # Move to correct store's calendar if account specified
-        if account:
+                all_day, reminder_minutes, account, calendar):
+        # Create directly inside the target calendar folder if one was
+        # requested. (Note: creating via outlook.CreateItem() and then
+        # calling .Move() on the unsaved item fails with a COM exception —
+        # Move only works on items that already exist in a folder.)
+        if account or calendar:
             store = _require_store(namespace, account)
-            cal = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
-            appt.Move(cal)
-            appt = namespace.GetItemFromID(appt.EntryID)
+            if calendar:
+                cal = _resolve_folder(namespace, calendar, store)
+                if cal is None:
+                    return (
+                        f"Error: Calendar folder '{calendar}' not found. "
+                        "Use list_calendars to see available calendar folders."
+                    )
+            else:
+                cal = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
+            appt = cal.Items.Add(OL_APPOINTMENT_ITEM)
+        else:
+            appt = outlook.CreateItem(OL_APPOINTMENT_ITEM)
         appt.Subject = subject
         appt.Start = start
         appt.End = end
@@ -965,15 +982,78 @@ async def create_event(
             "start": str(appt.Start),
             "end": str(appt.End),
             "entry_id": appt.EntryID,
+            "calendar": calendar or "(default)",
         }, indent=2, default=str)
 
     try:
         return await bridge.call(
             _create, subject, start, end, location, body, all_day,
-            reminder_minutes, account,
+            reminder_minutes, account, calendar,
         )
     except Exception as e:
         return f"Error creating event: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL: list_calendars
+# =====================================================================
+
+@mcp.tool()
+async def list_calendars(account: str = "") -> str:
+    """List all calendar folders available in an account.
+
+    Includes the default Calendar plus any additional calendar folders —
+    e.g. a shared "Your family" calendar, or calendars synced in from
+    Google/other providers. Use the returned "full_path" (or a unique
+    "name") as the `calendar` argument to create_event to target a
+    specific calendar.
+
+    Args:
+        account: Optional. Account display name (or substring) to target.
+            Default: primary account. Use list_accounts to see available accounts.
+
+    Returns:
+        JSON array of calendar folder objects with name, full_path, and item_count.
+    """
+    def _list(outlook, namespace, account):
+        store = _require_store(namespace, account)
+        root = store.GetRootFolder()
+        results = []
+
+        def walk(f, path_prefix):
+            current_path = f"{path_prefix}/{f.Name}" if path_prefix else f.Name
+            try:
+                is_calendar = f.DefaultItemType == OL_APPOINTMENT_ITEM
+            except Exception:
+                is_calendar = False
+            if is_calendar:
+                try:
+                    item_count = f.Items.Count
+                except Exception:
+                    item_count = None
+                results.append({
+                    "name": f.Name,
+                    "full_path": current_path,
+                    "item_count": item_count,
+                })
+            for i in range(f.Folders.Count):
+                try:
+                    walk(f.Folders.Item(i + 1), current_path)
+                except Exception:
+                    continue
+
+        for i in range(root.Folders.Count):
+            try:
+                walk(root.Folders.Item(i + 1), "")
+            except Exception:
+                continue
+
+        return json.dumps(results, indent=2, default=str)
+
+    try:
+        return await bridge.call(_list, account)
+    except Exception as e:
+        return f"Error listing calendars: {format_com_error(e)}"
 
 
 # =====================================================================
@@ -1402,13 +1482,16 @@ async def create_task(
     """
     def _create(outlook, namespace, subject, body, due_date, importance,
                 reminder_minutes, account):
-        task = outlook.CreateItem(OL_TASK_ITEM)
-        # Move to correct store's tasks folder if account specified
+        # Create directly inside the target store's tasks folder if one was
+        # requested. (Note: creating via outlook.CreateItem() and then
+        # calling .Move() on the unsaved item fails with a COM exception —
+        # Move only works on items that already exist in a folder.)
         if account:
             store = _require_store(namespace, account)
             tasks_folder = store.GetDefaultFolder(OL_FOLDER_TASKS)
-            task.Move(tasks_folder)
-            task = namespace.GetItemFromID(task.EntryID)
+            task = tasks_folder.Items.Add(OL_TASK_ITEM)
+        else:
+            task = outlook.CreateItem(OL_TASK_ITEM)
         task.Subject = subject
         if body:
             task.Body = body
