@@ -852,6 +852,7 @@ async def list_events(
     end_date: str = "",
     count: int = 20,
     account: str = "",
+    calendar: str = "",
 ) -> str:
     """List upcoming calendar events from Outlook.
 
@@ -870,15 +871,28 @@ async def list_events(
         count: Maximum number of events to return. Default 20.
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
+        calendar: Optional. Name or slash-delimited path of a specific
+            calendar folder to read, e.g. "Your family" or
+            "Kalender/Your family". Use list_calendars to discover available
+            calendar folders (including shared/synced ones). Default: the
+            account's default Calendar folder.
 
     Returns:
         JSON array of event summary objects.
     """
-    def _list(outlook, namespace, start_date, end_date, count, account):
+    def _list(outlook, namespace, start_date, end_date, count, account, calendar):
         count = min(max(1, count), 200)
         store = _require_store(namespace, account)
-        calendar = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
-        items = calendar.Items
+        if calendar:
+            cal_folder = _resolve_folder(namespace, calendar, store)
+            if cal_folder is None:
+                return (
+                    f"Error: Calendar folder '{calendar}' not found. "
+                    "Use list_calendars to see available calendar folders."
+                )
+        else:
+            cal_folder = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
+        items = cal_folder.Items
 
         # CRITICAL ORDER: Sort BEFORE IncludeRecurrences BEFORE Restrict
         items.Sort("[Start]")
@@ -907,7 +921,7 @@ async def list_events(
         return json.dumps(results, indent=2, default=str)
 
     try:
-        return await bridge.call(_list, start_date, end_date, count, account)
+        return await bridge.call(_list, start_date, end_date, count, account, calendar)
     except Exception as e:
         return f"Error listing events: {format_com_error(e)}"
 
@@ -1374,6 +1388,7 @@ async def search_events(
     end_date: str = "",
     count: int = 10,
     account: str = "",
+    calendar: str = "",
 ) -> str:
     """Search for calendar events by keyword.
 
@@ -1389,15 +1404,28 @@ async def search_events(
         count: Maximum results to return. Default 10.
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
+        calendar: Optional. Name or slash-delimited path of a specific
+            calendar folder to search, e.g. "Your family" or
+            "Kalender/Your family". Use list_calendars to discover available
+            calendar folders (including shared/synced ones). Default: the
+            account's default Calendar folder.
 
     Returns:
         JSON array of matching event summaries.
     """
-    def _search(outlook, namespace, query, start_date, end_date, count, account):
+    def _search(outlook, namespace, query, start_date, end_date, count, account, calendar):
         count = min(max(1, count), 200)
         store = _require_store(namespace, account)
-        calendar = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
-        items = calendar.Items
+        if calendar:
+            cal_folder = _resolve_folder(namespace, calendar, store)
+            if cal_folder is None:
+                return (
+                    f"Error: Calendar folder '{calendar}' not found. "
+                    "Use list_calendars to see available calendar folders."
+                )
+        else:
+            cal_folder = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
+        items = cal_folder.Items
         items.Sort("[Start]")
         items.IncludeRecurrences = True
 
@@ -1424,7 +1452,7 @@ async def search_events(
         return json.dumps(results, indent=2, default=str)
 
     try:
-        return await bridge.call(_search, query, start_date, end_date, count, account)
+        return await bridge.call(_search, query, start_date, end_date, count, account, calendar)
     except Exception as e:
         return f"Error searching events: {format_com_error(e)}"
 
