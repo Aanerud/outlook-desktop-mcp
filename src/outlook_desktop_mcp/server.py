@@ -81,6 +81,43 @@ def _check_item_class(item, expected_class: int, label: str) -> str | None:
     return None
 
 
+# Email domains that may never send/reply — send_email and reply_email save
+# these as drafts instead of delivering them.
+_BLOCKED_SEND_DOMAINS = {"powercon.dk"}
+
+
+def _account_for_store(outlook, store):
+    """Return the outlook.Session.Accounts entry backed by store, or None."""
+    for acc in outlook.Session.Accounts:
+        if acc.DeliveryStore.StoreID == store.StoreID:
+            return acc
+    return None
+
+
+def _store_domain(store) -> str:
+    """Best-effort SMTP domain for a store, for stores with no Accounts
+    entry (shared/delegate mailboxes). Exchange StoreIDs embed the
+    mailbox's primary SMTP address in ASCII, so decode it directly."""
+    try:
+        text = bytes.fromhex(store.StoreID).decode("ascii", errors="ignore")
+    except (ValueError, AttributeError):
+        return ""
+    match = re.search(r"[\w.+-]+@([\w.-]+)", text)
+    return match.group(1).lower() if match else ""
+
+
+def _is_send_blocked(outlook, store) -> bool:
+    """True if the account backing store is not allowed to send/reply."""
+    acc = _account_for_store(outlook, store)
+    domain = ""
+    if acc is not None:
+        smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
+        domain = smtp.rsplit("@", 1)[-1] if "@" in smtp else ""
+    if not domain:
+        domain = _store_domain(store)
+    return domain in _BLOCKED_SEND_DOMAINS
+
+
 # --- MCP Server ---
 
 mcp = FastMCP(
@@ -282,10 +319,9 @@ async def send_email(
         store = _require_store(namespace, account)
         mail = outlook.CreateItem(OL_MAIL_ITEM)
         # Set the sending account
-        for acc in outlook.Session.Accounts:
-            if acc.DeliveryStore.StoreID == store.StoreID:
-                mail._oleobj_.Invoke(*(64209, 0, 8, 0, acc))  # SendUsingAccount
-                break
+        acc = _account_for_store(outlook, store)
+        if acc is not None:
+            mail._oleobj_.Invoke(*(64209, 0, 8, 0, acc))  # SendUsingAccount
         mail.To = to
         mail.Subject = subject
         mail.Body = body
@@ -295,6 +331,12 @@ async def send_email(
             mail.BCC = bcc
         if html_body:
             mail.HTMLBody = html_body
+        if _is_send_blocked(outlook, store):
+            mail.Save()
+            return (
+                f"Sending from this account is disabled — saved as a draft "
+                f"instead: '{subject}' to {to} (entry_id: {mail.EntryID})"
+            )
         mail.Send()
         return f"Email sent: '{subject}' to {to}"
 
@@ -609,8 +651,16 @@ async def reply_email(
         if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
             return err
         subject = item.Subject
+        store = item.Parent.Store
         reply_item = item.ReplyAll() if reply_all else item.Reply()
         reply_item.Body = body + "\n\n" + reply_item.Body
+        if _is_send_blocked(outlook, store):
+            reply_item.Save()
+            return (
+                f"Sending from this account is disabled — reply to "
+                f"'{subject}' saved as a draft instead "
+                f"(entry_id: {reply_item.EntryID})"
+            )
         reply_item.Send()
         return f"Reply sent to '{subject}' (reply_all={reply_all})"
 
