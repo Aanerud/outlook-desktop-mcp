@@ -81,6 +81,43 @@ def _check_item_class(item, expected_class: int, label: str) -> str | None:
     return None
 
 
+# Email domains that may never send/reply — send_email and reply_email save
+# these as drafts instead of delivering them.
+_BLOCKED_SEND_DOMAINS = {"powercon.dk"}
+
+
+def _account_for_store(outlook, store):
+    """Return the outlook.Session.Accounts entry backed by store, or None."""
+    for acc in outlook.Session.Accounts:
+        if acc.DeliveryStore.StoreID == store.StoreID:
+            return acc
+    return None
+
+
+def _store_domain(store) -> str:
+    """Best-effort SMTP domain for a store, for stores with no Accounts
+    entry (shared/delegate mailboxes). Exchange StoreIDs embed the
+    mailbox's primary SMTP address in ASCII, so decode it directly."""
+    try:
+        text = bytes.fromhex(store.StoreID).decode("ascii", errors="ignore")
+    except (ValueError, AttributeError):
+        return ""
+    match = re.search(r"[\w.+-]+@([\w.-]+)", text)
+    return match.group(1).lower() if match else ""
+
+
+def _is_send_blocked(outlook, store) -> bool:
+    """True if the account backing store is not allowed to send/reply."""
+    acc = _account_for_store(outlook, store)
+    domain = ""
+    if acc is not None:
+        smtp = (getattr(acc, "SmtpAddress", "") or "").lower()
+        domain = smtp.rsplit("@", 1)[-1] if "@" in smtp else ""
+    if not domain:
+        domain = _store_domain(store)
+    return domain in _BLOCKED_SEND_DOMAINS
+
+
 # --- MCP Server ---
 
 mcp = FastMCP(
@@ -282,10 +319,9 @@ async def send_email(
         store = _require_store(namespace, account)
         mail = outlook.CreateItem(OL_MAIL_ITEM)
         # Set the sending account
-        for acc in outlook.Session.Accounts:
-            if acc.DeliveryStore.StoreID == store.StoreID:
-                mail._oleobj_.Invoke(*(64209, 0, 8, 0, acc))  # SendUsingAccount
-                break
+        acc = _account_for_store(outlook, store)
+        if acc is not None:
+            mail._oleobj_.Invoke(*(64209, 0, 8, 0, acc))  # SendUsingAccount
         mail.To = to
         mail.Subject = subject
         mail.Body = body
@@ -295,6 +331,12 @@ async def send_email(
             mail.BCC = bcc
         if html_body:
             mail.HTMLBody = html_body
+        if _is_send_blocked(outlook, store):
+            mail.Save()
+            return (
+                f"Sending from this account is disabled — saved as a draft "
+                f"instead: '{subject}' to {to} (entry_id: {mail.EntryID})"
+            )
         mail.Send()
         return f"Email sent: '{subject}' to {to}"
 
@@ -609,8 +651,16 @@ async def reply_email(
         if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
             return err
         subject = item.Subject
+        store = item.Parent.Store
         reply_item = item.ReplyAll() if reply_all else item.Reply()
         reply_item.Body = body + "\n\n" + reply_item.Body
+        if _is_send_blocked(outlook, store):
+            reply_item.Save()
+            return (
+                f"Sending from this account is disabled — reply to "
+                f"'{subject}' saved as a draft instead "
+                f"(entry_id: {reply_item.EntryID})"
+            )
         reply_item.Send()
         return f"Reply sent to '{subject}' (reply_all={reply_all})"
 
@@ -802,6 +852,7 @@ async def list_events(
     end_date: str = "",
     count: int = 20,
     account: str = "",
+    calendar: str = "",
 ) -> str:
     """List upcoming calendar events from Outlook.
 
@@ -820,15 +871,28 @@ async def list_events(
         count: Maximum number of events to return. Default 20.
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
+        calendar: Optional. Name or slash-delimited path of a specific
+            calendar folder to read, e.g. "Your family" or
+            "Kalender/Your family". Use list_calendars to discover available
+            calendar folders (including shared/synced ones). Default: the
+            account's default Calendar folder.
 
     Returns:
         JSON array of event summary objects.
     """
-    def _list(outlook, namespace, start_date, end_date, count, account):
+    def _list(outlook, namespace, start_date, end_date, count, account, calendar):
         count = min(max(1, count), 200)
         store = _require_store(namespace, account)
-        calendar = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
-        items = calendar.Items
+        if calendar:
+            cal_folder = _resolve_folder(namespace, calendar, store)
+            if cal_folder is None:
+                return (
+                    f"Error: Calendar folder '{calendar}' not found. "
+                    "Use list_calendars to see available calendar folders."
+                )
+        else:
+            cal_folder = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
+        items = cal_folder.Items
 
         # CRITICAL ORDER: Sort BEFORE IncludeRecurrences BEFORE Restrict
         items.Sort("[Start]")
@@ -857,7 +921,7 @@ async def list_events(
         return json.dumps(results, indent=2, default=str)
 
     try:
-        return await bridge.call(_list, start_date, end_date, count, account)
+        return await bridge.call(_list, start_date, end_date, count, account, calendar)
     except Exception as e:
         return f"Error listing events: {format_com_error(e)}"
 
@@ -910,6 +974,7 @@ async def create_event(
     all_day: bool = False,
     reminder_minutes: int = 15,
     account: str = "",
+    calendar: str = "",
 ) -> str:
     """Create a personal calendar appointment (no attendees).
 
@@ -932,19 +997,35 @@ async def create_event(
             Default 15. Set to 0 to disable reminder.
         account: Optional. Account display name (or substring) to create
             the event in. Default: primary account.
+        calendar: Optional. Name or slash-delimited path of a specific
+            calendar folder to create the event in, e.g. "Your family" or
+            "Kalender/Your family". Use list_calendars to discover available
+            calendar folders (including shared/synced ones). Default: the
+            account's default Calendar folder.
 
     Returns:
         Confirmation with event subject and entry_id, or an error.
     """
     def _create(outlook, namespace, subject, start, end, location, body,
-                all_day, reminder_minutes, account):
-        appt = outlook.CreateItem(OL_APPOINTMENT_ITEM)
-        # Move to correct store's calendar if account specified
-        if account:
+                all_day, reminder_minutes, account, calendar):
+        # Create directly inside the target calendar folder if one was
+        # requested. (Note: creating via outlook.CreateItem() and then
+        # calling .Move() on the unsaved item fails with a COM exception —
+        # Move only works on items that already exist in a folder.)
+        if account or calendar:
             store = _require_store(namespace, account)
-            cal = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
-            appt.Move(cal)
-            appt = namespace.GetItemFromID(appt.EntryID)
+            if calendar:
+                cal = _resolve_folder(namespace, calendar, store)
+                if cal is None:
+                    return (
+                        f"Error: Calendar folder '{calendar}' not found. "
+                        "Use list_calendars to see available calendar folders."
+                    )
+            else:
+                cal = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
+            appt = cal.Items.Add(OL_APPOINTMENT_ITEM)
+        else:
+            appt = outlook.CreateItem(OL_APPOINTMENT_ITEM)
         appt.Subject = subject
         appt.Start = start
         appt.End = end
@@ -965,15 +1046,78 @@ async def create_event(
             "start": str(appt.Start),
             "end": str(appt.End),
             "entry_id": appt.EntryID,
+            "calendar": calendar or "(default)",
         }, indent=2, default=str)
 
     try:
         return await bridge.call(
             _create, subject, start, end, location, body, all_day,
-            reminder_minutes, account,
+            reminder_minutes, account, calendar,
         )
     except Exception as e:
         return f"Error creating event: {format_com_error(e)}"
+
+
+# =====================================================================
+# TOOL: list_calendars
+# =====================================================================
+
+@mcp.tool()
+async def list_calendars(account: str = "") -> str:
+    """List all calendar folders available in an account.
+
+    Includes the default Calendar plus any additional calendar folders —
+    e.g. a shared "Your family" calendar, or calendars synced in from
+    Google/other providers. Use the returned "full_path" (or a unique
+    "name") as the `calendar` argument to create_event to target a
+    specific calendar.
+
+    Args:
+        account: Optional. Account display name (or substring) to target.
+            Default: primary account. Use list_accounts to see available accounts.
+
+    Returns:
+        JSON array of calendar folder objects with name, full_path, and item_count.
+    """
+    def _list(outlook, namespace, account):
+        store = _require_store(namespace, account)
+        root = store.GetRootFolder()
+        results = []
+
+        def walk(f, path_prefix):
+            current_path = f"{path_prefix}/{f.Name}" if path_prefix else f.Name
+            try:
+                is_calendar = f.DefaultItemType == OL_APPOINTMENT_ITEM
+            except Exception:
+                is_calendar = False
+            if is_calendar:
+                try:
+                    item_count = f.Items.Count
+                except Exception:
+                    item_count = None
+                results.append({
+                    "name": f.Name,
+                    "full_path": current_path,
+                    "item_count": item_count,
+                })
+            for i in range(f.Folders.Count):
+                try:
+                    walk(f.Folders.Item(i + 1), current_path)
+                except Exception:
+                    continue
+
+        for i in range(root.Folders.Count):
+            try:
+                walk(root.Folders.Item(i + 1), "")
+            except Exception:
+                continue
+
+        return json.dumps(results, indent=2, default=str)
+
+    try:
+        return await bridge.call(_list, account)
+    except Exception as e:
+        return f"Error listing calendars: {format_com_error(e)}"
 
 
 # =====================================================================
@@ -1244,6 +1388,7 @@ async def search_events(
     end_date: str = "",
     count: int = 10,
     account: str = "",
+    calendar: str = "",
 ) -> str:
     """Search for calendar events by keyword.
 
@@ -1259,15 +1404,28 @@ async def search_events(
         count: Maximum results to return. Default 10.
         account: Optional. Account display name (or substring) to target.
             Default: primary account. Use list_accounts to see available accounts.
+        calendar: Optional. Name or slash-delimited path of a specific
+            calendar folder to search, e.g. "Your family" or
+            "Kalender/Your family". Use list_calendars to discover available
+            calendar folders (including shared/synced ones). Default: the
+            account's default Calendar folder.
 
     Returns:
         JSON array of matching event summaries.
     """
-    def _search(outlook, namespace, query, start_date, end_date, count, account):
+    def _search(outlook, namespace, query, start_date, end_date, count, account, calendar):
         count = min(max(1, count), 200)
         store = _require_store(namespace, account)
-        calendar = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
-        items = calendar.Items
+        if calendar:
+            cal_folder = _resolve_folder(namespace, calendar, store)
+            if cal_folder is None:
+                return (
+                    f"Error: Calendar folder '{calendar}' not found. "
+                    "Use list_calendars to see available calendar folders."
+                )
+        else:
+            cal_folder = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
+        items = cal_folder.Items
         items.Sort("[Start]")
         items.IncludeRecurrences = True
 
@@ -1294,7 +1452,7 @@ async def search_events(
         return json.dumps(results, indent=2, default=str)
 
     try:
-        return await bridge.call(_search, query, start_date, end_date, count, account)
+        return await bridge.call(_search, query, start_date, end_date, count, account, calendar)
     except Exception as e:
         return f"Error searching events: {format_com_error(e)}"
 
@@ -1402,13 +1560,16 @@ async def create_task(
     """
     def _create(outlook, namespace, subject, body, due_date, importance,
                 reminder_minutes, account):
-        task = outlook.CreateItem(OL_TASK_ITEM)
-        # Move to correct store's tasks folder if account specified
+        # Create directly inside the target store's tasks folder if one was
+        # requested. (Note: creating via outlook.CreateItem() and then
+        # calling .Move() on the unsaved item fails with a COM exception —
+        # Move only works on items that already exist in a folder.)
         if account:
             store = _require_store(namespace, account)
             tasks_folder = store.GetDefaultFolder(OL_FOLDER_TASKS)
-            task.Move(tasks_folder)
-            task = namespace.GetItemFromID(task.EntryID)
+            task = tasks_folder.Items.Add(OL_TASK_ITEM)
+        else:
+            task = outlook.CreateItem(OL_TASK_ITEM)
         task.Subject = subject
         if body:
             task.Body = body
