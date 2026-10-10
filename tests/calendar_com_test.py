@@ -6,9 +6,15 @@ building the MCP layer. Requires Classic Outlook (Desktop) to be running.
 
 Run: .venv\\Scripts\\python tests\\calendar_com_test.py
 """
+import os
 import sys
 import time
 from datetime import datetime, timedelta
+
+# Ensure our package is importable
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from outlook_desktop_mcp.utils.dates import restrict_date
 
 
 def log(msg):
@@ -43,8 +49,8 @@ def test_list_upcoming_events(namespace, days=7):
     start = datetime.now()
     end = start + timedelta(days=days)
     restrict = (
-        f"[Start] >= '{start.strftime('%m/%d/%Y')}' "
-        f"AND [Start] <= '{end.strftime('%m/%d/%Y')}'"
+        f"[Start] >= '{restrict_date(start)}' "
+        f"AND [Start] <= '{restrict_date(end)}'"
     )
     filtered = items.Restrict(restrict)
 
@@ -73,8 +79,8 @@ def test_read_event_details(namespace):
     start = datetime.now()
     end = start + timedelta(days=30)
     restrict = (
-        f"[Start] >= '{start.strftime('%m/%d/%Y')}' "
-        f"AND [Start] <= '{end.strftime('%m/%d/%Y')}'"
+        f"[Start] >= '{restrict_date(start)}' "
+        f"AND [Start] <= '{restrict_date(end)}'"
     )
     filtered = items.Restrict(restrict)
 
@@ -194,8 +200,8 @@ def test_search_events(namespace, keyword="MCP"):
     start = datetime.now() - timedelta(days=30)
     end = datetime.now() + timedelta(days=30)
     restrict = (
-        f"[Start] >= '{start.strftime('%m/%d/%Y')}' "
-        f"AND [Start] <= '{end.strftime('%m/%d/%Y')}'"
+        f"[Start] >= '{restrict_date(start)}' "
+        f"AND [Start] <= '{restrict_date(end)}'"
     )
     filtered = items.Restrict(restrict)
 
