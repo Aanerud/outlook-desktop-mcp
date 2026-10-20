@@ -22,6 +22,8 @@ classifiers = [
 dependencies = [
     "pywin32>=310; sys_platform == 'win32'",
     "mcp[cli]>=1.26.0",
+    "striprtf==0.0.33",
+    "RTFDE==0.1.2.2",
 ]
 
 [project.urls]
