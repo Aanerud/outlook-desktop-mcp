@@ -817,9 +817,9 @@ async def list_events(
 ) -> str:
     """List upcoming calendar events from Outlook.
 
-    Returns a JSON array of event summaries within a date range, sorted by
-    start time. Each summary has entry_id, subject, start, end, duration,
-    location, organizer, and attendee info.
+    Returns a JSON array of events overlapping the [start_date, end_date)
+    range, sorted by start time. Each summary has entry_id, subject, start,
+    end, duration, location, organizer, and attendee info.
 
     Use entry_id from results with get_event, update_event, or delete_event.
 
@@ -834,16 +834,17 @@ async def list_events(
     """
     start = datetime.fromisoformat(start_date) if start_date else datetime.now()
     end = datetime.fromisoformat(end_date) if end_date else start + timedelta(days=7)
+    if start.tzinfo is not None:
+        start = start.astimezone().replace(tzinfo=None)
+    if end.tzinfo is not None:
+        end = end.astimezone().replace(tzinfo=None)
 
-    # Fetch more than needed, filter by date in Python since AppleScript
-    # whose-clause date filtering can be unreliable in Outlook for Mac.
-    fetch_limit = count * 3  # overfetch to account for out-of-range events
-
+    # AppleScript whose-clause date filtering can be unreliable in Outlook for
+    # Mac, so fetch all events and apply the requested range in Python.
     script = f'''tell application "Microsoft Outlook"
     set evts to calendar events
     set evtCount to count of evts
-    set maxFetch to {fetch_limit}
-    if evtCount < maxFetch then set maxFetch to evtCount
+    set maxFetch to evtCount
     set output to ""
     repeat with i from 1 to maxFetch
         set e to item i of evts
@@ -878,6 +879,16 @@ end tell'''
             parts = record.split(DELIM)
             if len(parts) < 7:
                 continue
+            event_start = datetime.fromisoformat(parse_date(parts[2].strip()))
+            event_end = datetime.fromisoformat(parse_date(parts[3].strip()))
+            if event_start.tzinfo is not None:
+                event_start = event_start.astimezone().replace(tzinfo=None)
+            if event_end.tzinfo is not None:
+                event_end = event_end.astimezone().replace(tzinfo=None)
+            # Treat the requested range as [start, end). Include events that
+            # overlap it, including events that began before the range.
+            if event_end <= start or event_start >= end:
+                continue
             results.append({
                 "entry_id": parts[0].strip(),
                 "subject": parts[1].strip() or "(no subject)",
@@ -886,7 +897,12 @@ end tell'''
                 "location": _clean(parts[4]),
                 "organizer": _clean(parts[5]),
                 "all_day": parts[6].strip().lower() == "true",
+                "_sort_start": event_start,
             })
+        results.sort(key=lambda event: event["_sort_start"])
+        results = results[:max(0, count)]
+        for event in results:
+            del event["_sort_start"]
         return json.dumps(results, indent=2, default=str)
     except Exception as e:
         return f"Error listing events: {e}"
